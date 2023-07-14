@@ -1,0 +1,20 @@
+[package]
+name = "shadow_reconstruction"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "shadow_reconstruction"
+crate-type = ["cdylib"]
+
+[features]
+
+[dependencies]
+pyo3 = { version = "^0.18", features = ["extension-module", "num-complex"] }
+ndarray = {version = "^0.15", features = ["rayon"]}
+num-complex = "*"
+numpy = "^0.18"
+num-traits = "^0.2"
+rayon = "^1.7"
+sprs = "^0.11"
+rand = "^0.8"

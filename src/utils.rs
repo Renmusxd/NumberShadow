@@ -42,8 +42,8 @@ where
     P: Clone + Add<Output = P> + One,
 {
     let mut a = TriMat::new((1 << perm.len(), 1 << perm.len()));
-    // (0..1 << perm.len()).for_each(|i| a.add_triplet(permute_bits(i, perm), i, P::one()));
-    (0..1 << perm.len()).for_each(|i| a.add_triplet(i, permute_bits(i, perm), P::one()));
+    (0..1 << perm.len()).for_each(|i| a.add_triplet(permute_bits(i, perm), i, P::one()));
+    // (0..1 << perm.len()).for_each(|i| a.add_triplet(i, permute_bits(i, perm), P::one()));
     a.to_csr()
 }
 

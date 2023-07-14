@@ -161,8 +161,8 @@ fn estimate_string_for_sample(
             // let site_a = sample.perm[2 * pair_index];
             // let site_b = sample.perm[2 * pair_index + 1];
 
-            let site_a = sample.perm[2 * pair_index];
-            let site_b = sample.perm[2 * pair_index + 1];
+            let site_a = perm_inv[2 * pair_index];
+            let site_b = perm_inv[2 * pair_index + 1];
 
             let pauli_a = ps.get(site_a);
             let pauli_b = ps.get(site_b);
@@ -211,9 +211,18 @@ fn estimate_string_for_sample(
 }
 
 fn filter_permutations(perm: &[usize], noni_indices: &[usize]) -> bool {
+    let mut perm_inv = perm.to_vec();
+    for (i, k) in perm.iter().enumerate() {
+        perm_inv[*k] = i;
+    }
+
     (0..perm.len() / 2).all(|pair_index| {
-        let sia = perm[2 * pair_index];
-        let sib = perm[2 * pair_index + 1];
+        // let sia = perm[2 * pair_index];
+        // let sib = perm[2 * pair_index + 1];
+
+        let sia = perm_inv[2 * pair_index];
+        let sib = perm_inv[2 * pair_index + 1];
+
         noni_indices.contains(&sia) == noni_indices.contains(&sib)
     })
 }
@@ -349,7 +358,7 @@ mod tests {
         let measured =
             estimate_string_for_sample(&opstring, &sample, pauli_pairs.view(), pairwise_ops.view());
 
-        assert!((measured.re - 1.0).abs() < f64::EPSILON);
+        assert!((measured.re + 1.0).abs() < f64::EPSILON);
         assert!((measured.im).abs() < f64::EPSILON);
 
         Ok(())
