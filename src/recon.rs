@@ -40,7 +40,6 @@ impl Reconstruction {
     ) -> PyResult<Py<PyArray1<Complex<f64>>>> {
         let ps = OperatorString::try_new(op.chars()).map_err(PyValueError::new_err)?;
 
-        let mut samples_estimates = Array1::zeros(samples.samples.len());
         let pauli_pairs = make_numcons_pauli_pairs();
 
         let enumerating_indices = (0..ps.opstring.len()).collect::<Vec<_>>();
@@ -61,22 +60,25 @@ impl Reconstruction {
         let subop: OperatorString = noni_substring.clone().into();
         let cw = channel_weight(&subop);
         if cw.abs() > f64::EPSILON {
-            samples_estimates
-                .axis_iter_mut(Axis(0))
-                .into_par_iter()
-                .zip(samples.samples.par_iter())
-                .filter(|(_, sample)| filter_permutations(&sample.perm, &noni_indices))
-                .for_each(|(mut x, sample)| {
-                    *x.get_mut([]).unwrap() = estimate_string_for_sample(
+            let samples = samples
+                .samples
+                .par_iter()
+                .filter(|sample| filter_permutations(&sample.perm, &noni_indices))
+                .map(|sample| {
+                    let est = estimate_string_for_sample(
                         &ps,
                         sample,
                         pauli_pairs.view(),
                         self.pairwise_ops.view(),
                     );
-                });
+                    est / cw
+                })
+                .collect::<Vec<Complex<f64>>>();
+            let samples = Array1::from_vec(samples);
+            Ok(samples.to_pyarray(py).to_owned())
+        } else {
+            Err(PyValueError::new_err("Zero channel weight"))
         }
-
-        Ok(samples_estimates.to_pyarray(py).to_owned())
     }
 
     fn estimate_operator_string(&self, op: String, samples: &Samples) -> Complex<f64> {
