@@ -1,0 +1,6 @@
+maturin
+scipy
+qutip
+numpy
+matplotlib
+jupyter
