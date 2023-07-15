@@ -262,9 +262,9 @@ impl OpChar {
     }
 }
 
-impl Into<usize> for OpChar {
-    fn into(self) -> usize {
-        match self {
+impl From<OpChar> for usize {
+    fn from(val: OpChar) -> Self {
+        match val {
             OpChar::Z => 0,
             OpChar::Plus => 1,
             OpChar::Minus => 2,

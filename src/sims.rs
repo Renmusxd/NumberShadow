@@ -105,11 +105,10 @@ impl Experiment {
     }
 
     #[staticmethod]
-    fn make_perm_mat<'a>(py: Python<'a>, perm: Vec<usize>) -> PyResult<&'a PyAny> {
+    fn make_perm_mat(py: Python<'_>, perm: Vec<usize>) -> PyResult<&PyAny> {
         let permmat = make_perm::<f64>(&perm);
         scipy_mat(py, &permmat)
-            .map(|e| e)
-            .map_err(|e| PyValueError::new_err(e))
+            .map_err(PyValueError::new_err)
     }
 }
 
@@ -131,8 +130,7 @@ fn measure_channel(
         let buspsub = bus.mul(rho).mul(&bust);
         debug_assert_eq!(buspsub.shape(), (1, 1));
         let x = buspsub
-            .get(0, 0)
-            .map(|x| *x)
+            .get(0, 0).copied()
             .unwrap_or(Complex::<f64>::zero());
         debug_assert!(x.im < 1e-10);
         random_float -= x.re;
@@ -140,7 +138,7 @@ fn measure_channel(
             return i;
         }
     }
-    return (1 << qubits) - 1;
+    (1 << qubits) - 1
 }
 
 fn measure_channel_dumb(
@@ -163,7 +161,7 @@ fn measure_channel_dumb(
         }
         i += 1;
     }
-    return diag.len() - 1;
+    diag.len() - 1
 }
 
 #[pyclass]
@@ -183,9 +181,9 @@ impl DensityMatrix {
         let row_slice = rows.as_slice().unwrap();
         let col_slice = cols.as_slice().unwrap();
         let coe_slice = coefs.as_slice().unwrap();
-        let ri = row_slice.into_iter();
-        let ci = col_slice.into_iter();
-        let vi = coe_slice.into_iter();
+        let ri = row_slice.iter();
+        let ci = col_slice.iter();
+        let vi = coe_slice.iter();
         let i = ri.zip(ci.zip(vi)).map(|(a, (b, c))| (*a, *b, *c));
         let mat = Self::make_sprs(n, i);
         Self { mat }
@@ -259,15 +257,12 @@ impl DensityMatrix {
 
 #[pyclass]
 #[derive(Serialize, Deserialize)]
+#[derive(Default)]
 pub struct Samples {
     pub samples: Vec<Sample>,
 }
 
-impl Default for Samples {
-    fn default() -> Self {
-        Self { samples: vec![] }
-    }
-}
+
 
 #[pymethods]
 impl Samples {
@@ -291,7 +286,7 @@ impl Samples {
     fn save_to(&self, filename: &str) -> PyResult<()> {
         let filepath = Path::new(filename);
         let mut file =
-            File::create(&filepath).map_err(|e| PyValueError::new_err(format!("{:?}", e)))?;
+            File::create(filepath).map_err(|e| PyValueError::new_err(format!("{:?}", e)))?;
         let encoded =
             bincode::serialize(self).map_err(|e| PyValueError::new_err(format!("{:?}", e)))?;
         file.write_all(&encoded)
@@ -304,7 +299,7 @@ impl Samples {
         let filepath = Path::new(filename);
         let mut buf = vec![];
         let mut file =
-            File::open(&filepath).map_err(|e| PyValueError::new_err(format!("{:?}", e)))?;
+            File::open(filepath).map_err(|e| PyValueError::new_err(format!("{:?}", e)))?;
         file.read_to_end(&mut buf)
             .map_err(|e| PyValueError::new_err(format!("{:?}", e)))?;
         bincode::deserialize(&buf).map_err(|e| PyValueError::new_err(format!("{:?}", e)))
