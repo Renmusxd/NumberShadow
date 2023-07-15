@@ -1,35 +1,26 @@
 use crate::sims::{Sample, Samples};
-use crate::utils::{
-    fact, fact2, kron_helper, make_numcons_pauli_pairs, reverse_n_bits, scipy_mat, OpChar,
-    OperatorString,
-};
+use crate::utils::{fact, fact2, make_numcons_pauli_pairs, reverse_n_bits, OpChar, OperatorString};
 use num_complex::Complex;
 use num_traits::{One, ToPrimitive, Zero};
-use numpy::ndarray::{s, Array1, Array2, Array3, ArrayView3, ArrayView4, Axis};
+use numpy::ndarray::{s, Array1, Array2, Array3, ArrayView3, ArrayView4};
 use numpy::{PyArray1, PyReadonlyArray3, ToPyArray};
 use pyo3::exceptions::PyValueError;
 use pyo3::types::PyComplex;
 use pyo3::{pyclass, pymethods, Py, PyResult, Python};
 use rayon::prelude::*;
-use sprs::{CsMat, TriMat};
-use std::any::Any;
 
 #[pyclass]
 pub struct Reconstruction {
-    qubits: usize,
     pairwise_ops: Array3<Complex<f64>>,
 }
 
 #[pymethods]
 impl Reconstruction {
     #[new]
-    fn new(qubits: usize, ops: Option<PyReadonlyArray3<Complex<f64>>>) -> Self {
+    fn new(ops: Option<PyReadonlyArray3<Complex<f64>>>) -> Self {
         let ops = ops.unwrap().as_array().to_owned();
 
-        Self {
-            qubits,
-            pairwise_ops: ops,
-        }
+        Self { pairwise_ops: ops }
     }
 
     fn estimate_string_for_each_sample(
@@ -54,10 +45,10 @@ impl Reconstruction {
             .iter()
             .zip(ps.opstring.iter())
             .filter(|(_, op)| OpChar::I.ne(op))
-            .map(|(a, b)| (a.clone(), b.clone()))
+            .map(|(a, b)| (*a, *b))
             .unzip();
 
-        let subop: OperatorString = noni_substring.clone().into();
+        let subop: OperatorString = noni_substring.into();
         let cw = channel_weight(&subop);
         if cw.abs() > f64::EPSILON {
             let samples = samples
@@ -81,10 +72,12 @@ impl Reconstruction {
         }
     }
 
-    fn estimate_operator_string(&self, op: String, samples: &Samples) -> Complex<f64> {
+    fn estimate_operator_string(&self, op: String, samples: &Samples) -> PyResult<Complex<f64>> {
         let mut new_op = Operator::new();
-        new_op.add_string_rust(Complex::<f64>::one(), op, None);
-        self.estimate_operator(&new_op, samples)
+        new_op
+            .add_string_rust(Complex::<f64>::one(), op, None)
+            .map_err(PyValueError::new_err)?;
+        Ok(self.estimate_operator(&new_op, samples))
     }
 
     fn estimate_operator(&self, op: &Operator, samples: &Samples) -> Complex<f64> {
@@ -107,10 +100,10 @@ impl Reconstruction {
                     .iter()
                     .zip(ps.opstring.iter())
                     .filter(|(_, op)| OpChar::I.ne(op))
-                    .map(|(a, b)| (a.clone(), b.clone()))
+                    .map(|(a, b)| (*a, *b))
                     .unzip();
 
-                let subop: OperatorString = noni_substring.clone().into();
+                let subop: OperatorString = noni_substring.into();
                 let cw = channel_weight(&subop);
                 if cw.abs() < f64::EPSILON {
                     Complex::<f64>::zero()
@@ -200,13 +193,10 @@ fn estimate_string_for_sample(
                 debug_assert_eq!(b.shape(), buso.shape());
 
                 // Compute <b|USpSU|b>
-                let busosub = buso
-                    .into_iter()
+                buso.into_iter()
                     .zip(bu.into_iter())
                     .map(|(a, b)| a * b.conj())
-                    .sum::<Complex<f64>>();
-
-                busosub
+                    .sum::<Complex<f64>>()
             }
         })
         .product::<Complex<f64>>()
@@ -252,20 +242,15 @@ fn channel_weight(opstring: &OperatorString) -> f64 {
     let places_for_rest = fact(qubits - (count_m + count_p));
     let total_arrangements = fact(qubits);
 
-    return prefactor
+    prefactor
         * ((places_for_pluses * places_for_minuses * places_for_rest) as f64
-            / total_arrangements as f64);
+            / total_arrangements as f64)
 }
 
 #[pyclass]
+#[derive(Default)]
 pub struct Operator {
-    opstrings: Vec<(Complex<f64>, OperatorString)>,
-}
-
-impl Default for Operator {
-    fn default() -> Self {
-        Self { opstrings: vec![] }
-    }
+    pub opstrings: Vec<(Complex<f64>, OperatorString)>,
 }
 
 #[pymethods]
@@ -305,6 +290,7 @@ impl Operator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ndarray::Axis;
 
     #[test]
     fn check_weight_simple() -> Result<(), String> {

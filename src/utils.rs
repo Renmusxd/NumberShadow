@@ -103,7 +103,7 @@ where
                 let acc = kronecker_product(acc.view(), op.view());
                 Some(acc)
             } else {
-                Some(op.clone())
+                Some(op)
             }
         })
         .unwrap()
@@ -167,7 +167,7 @@ impl OperatorString {
         }
     }
 
-    fn new<VC>(chars: VC) -> Self
+    pub fn new<VC>(chars: VC) -> Self
     where
         VC: Into<Vec<OpChar>>,
     {
@@ -177,7 +177,7 @@ impl OperatorString {
         }
     }
 
-    fn new_indices<VI, VC>(indices: Option<VI>, chars: VC) -> Self
+    pub fn new_indices<VI, VC>(indices: Option<VI>, chars: VC) -> Self
     where
         VI: Into<Vec<usize>>,
         VC: Into<Vec<OpChar>>,
@@ -234,7 +234,7 @@ impl OperatorString {
     pub(crate) fn count_terms(&self) -> [usize; 4] {
         let mut counts = [0, 0, 0, 0];
         for op in &self.opstring {
-            let index: usize = op.clone().into();
+            let index: usize = (*op).into();
             counts[index] += 1;
         }
         counts

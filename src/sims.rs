@@ -1,18 +1,21 @@
 use num_traits::Zero;
 use pyo3::{pyclass, pymethods, PyAny, PyResult, Python};
+use std::fs::File;
+use std::io::{Read, Write};
 use std::ops::Mul;
+use std::path::Path;
 
 use crate::recon::Operator;
 use crate::utils::{
-    kron_helper, make_perm, make_sprs, make_sprs_onehot, reverse_n_bits, scipy_mat, OperatorString,
+    kron_helper, make_perm, make_sprs, make_sprs_onehot, scipy_mat, OperatorString,
 };
 use num_complex::Complex;
 use numpy::ndarray::{Array2, Array3, Axis};
 use numpy::{ndarray, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3};
 use pyo3::exceptions::PyValueError;
-use rand;
 use rand::prelude::*;
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 use sprs::*;
 
 #[pyclass]
@@ -31,7 +34,7 @@ impl Experiment {
         Self {
             qubits,
             pairwise_ops: ops.unwrap(),
-            perms: perms,
+            perms,
         }
     }
 }
@@ -68,8 +71,7 @@ impl Experiment {
                 // Lets compute (U.U.U.U)S = US
                 let ops = opis.iter().map(|opi| {
                     let op = self.pairwise_ops.index_axis(Axis(0), *opi);
-                    let op_sprs = make_sprs(op);
-                    op_sprs
+                    make_sprs(op)
                 });
 
                 let u = kron_helper(ops);
@@ -169,12 +171,6 @@ pub struct DensityMatrix {
     mat: CsMat<Complex<f64>>,
 }
 
-impl DensityMatrix {
-    fn new_raw(mat: CsMat<Complex<f64>>) -> Self {
-        Self { mat }
-    }
-}
-
 #[pymethods]
 impl DensityMatrix {
     #[new]
@@ -209,25 +205,46 @@ impl DensityMatrix {
         Self { mat: a.to_csr() }
     }
 
-    fn expectation(&self, op: &Operator) -> Complex<f64> {
-        unimplemented!()
+    fn expectation(&self, op: &Operator) -> PyResult<Complex<f64>> {
+        op.opstrings
+            .iter()
+            .try_fold(
+                Complex::zero(),
+                |acc, (c, ps)| -> Result<Complex<f64>, String> {
+                    let exp = self.expectation_opstring(ps)?;
+                    Ok(acc + c * exp)
+                },
+            )
+            .map_err(PyValueError::new_err)
     }
 
     fn expectation_string(&self, opstring: String) -> PyResult<Complex<f64>> {
         OperatorString::try_from(opstring)
-            .map(|x| {
-                let mat = x.make_matrix();
-                mat.mul(&self.mat)
-                    .diag()
-                    .iter()
-                    .map(|(_, c)| c)
-                    .sum::<Complex<f64>>()
-            })
+            .and_then(|x| self.expectation_opstring(&x))
             .map_err(PyValueError::new_err)
     }
 }
 
 impl DensityMatrix {
+    fn expectation_opstring(&self, opstring: &OperatorString) -> Result<Complex<f64>, String> {
+        let mat = opstring.make_matrix();
+        if mat.shape() != self.mat.shape() {
+            Err(format!(
+                "Expected operator of size {:?} but found {:?}",
+                self.mat.shape(),
+                mat.shape()
+            ))
+        } else {
+            let s = mat
+                .mul(&self.mat)
+                .diag()
+                .iter()
+                .map(|(_, c)| c)
+                .sum::<Complex<f64>>();
+            Ok(s)
+        }
+    }
+
     fn make_sprs<It>(n: usize, items: It) -> CsMat<Complex<f64>>
     where
         It: IntoIterator<Item = (usize, usize, Complex<f64>)>,
@@ -241,6 +258,7 @@ impl DensityMatrix {
 }
 
 #[pyclass]
+#[derive(Serialize, Deserialize)]
 pub struct Samples {
     pub samples: Vec<Sample>,
 }
@@ -269,10 +287,32 @@ impl Samples {
     fn get_sample(&self, index: usize) -> Sample {
         self.samples[index].clone()
     }
+
+    fn save_to(&self, filename: &str) -> PyResult<()> {
+        let filepath = Path::new(filename);
+        let mut file =
+            File::create(&filepath).map_err(|e| PyValueError::new_err(format!("{:?}", e)))?;
+        let encoded =
+            bincode::serialize(self).map_err(|e| PyValueError::new_err(format!("{:?}", e)))?;
+        file.write_all(&encoded)
+            .map_err(|e| PyValueError::new_err(format!("{:?}", e)))?;
+        Ok(())
+    }
+
+    #[staticmethod]
+    fn load_from(filename: &str) -> PyResult<Self> {
+        let filepath = Path::new(filename);
+        let mut buf = vec![];
+        let mut file =
+            File::open(&filepath).map_err(|e| PyValueError::new_err(format!("{:?}", e)))?;
+        file.read_to_end(&mut buf)
+            .map_err(|e| PyValueError::new_err(format!("{:?}", e)))?;
+        bincode::deserialize(&buf).map_err(|e| PyValueError::new_err(format!("{:?}", e)))
+    }
 }
 
 #[pyclass]
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Sample {
     pub gates: Vec<usize>,
     pub perm: Vec<usize>,
@@ -309,6 +349,12 @@ mod tests {
     use crate::utils::make_numcons_pauli_pairs;
     use num_complex::Complex;
     use num_traits::One;
+
+    impl DensityMatrix {
+        fn new_raw(mat: CsMat<Complex<f64>>) -> Self {
+            Self { mat }
+        }
+    }
 
     fn make_simple_rho(qubits: usize, i: usize) -> CsMat<Complex<f64>> {
         let mut a = TriMat::new((1 << qubits, 1 << qubits));
@@ -575,7 +621,7 @@ mod tests {
         let exp = Experiment::new_raw(qubits, Some(flat_paulis), None);
 
         let rho = DensityMatrix::new_raw(rho);
-        let samples = exp.sample_raw(&rho, 1000)?;
+        let _samples = exp.sample_raw(&rho, 1000)?;
 
         Ok(())
     }
