@@ -107,8 +107,7 @@ impl Experiment {
     #[staticmethod]
     fn make_perm_mat(py: Python<'_>, perm: Vec<usize>) -> PyResult<&PyAny> {
         let permmat = make_perm::<f64>(&perm);
-        scipy_mat(py, &permmat)
-            .map_err(PyValueError::new_err)
+        scipy_mat(py, &permmat).map_err(PyValueError::new_err)
     }
 }
 
@@ -129,9 +128,7 @@ fn measure_channel(
         debug_assert_eq!(bust.shape(), (1 << qubits, 1));
         let buspsub = bus.mul(rho).mul(&bust);
         debug_assert_eq!(buspsub.shape(), (1, 1));
-        let x = buspsub
-            .get(0, 0).copied()
-            .unwrap_or(Complex::<f64>::zero());
+        let x = buspsub.get(0, 0).copied().unwrap_or(Complex::<f64>::zero());
         debug_assert!(x.im < 1e-10);
         random_float -= x.re;
         if random_float <= 0.0 {
@@ -256,19 +253,22 @@ impl DensityMatrix {
 }
 
 #[pyclass]
-#[derive(Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Serialize, Deserialize, Default)]
 pub struct Samples {
     pub samples: Vec<Sample>,
 }
-
-
 
 #[pymethods]
 impl Samples {
     #[new]
     fn new() -> Self {
         Self::default()
+    }
+
+    fn subset(&self, n: usize) -> Self {
+        let mut rng = thread_rng();
+        let subset = self.samples.choose_multiple(&mut rng, n).cloned().collect();
+        Self { samples: subset }
     }
 
     fn num_samples(&self) -> usize {
