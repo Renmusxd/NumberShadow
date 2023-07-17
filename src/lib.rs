@@ -1,6 +1,6 @@
 mod recon;
 mod sims;
-mod utils;
+pub mod utils;
 
 use crate::recon::{Operator, Reconstruction};
 use crate::sims::*;

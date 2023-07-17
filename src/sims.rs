@@ -1,3 +1,4 @@
+use ndarray::indices;
 use num_traits::Zero;
 use pyo3::{pyclass, pymethods, PyAny, PyResult, Python};
 use std::fs::File;
@@ -6,6 +7,7 @@ use std::ops::Mul;
 use std::path::Path;
 
 use crate::recon::Operator;
+use crate::sims::DensityType::{Mixed, Pure};
 use crate::utils::{
     kron_helper, make_perm, make_sprs, make_sprs_onehot, scipy_mat, OperatorString,
 };
@@ -16,6 +18,7 @@ use pyo3::exceptions::PyValueError;
 use rand::prelude::*;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use sprs::vec::IntoSparseVecIter;
 use sprs::*;
 
 #[pyclass]
@@ -41,13 +44,28 @@ impl Experiment {
 
 impl Experiment {
     fn sample_raw(&self, rho: &DensityMatrix, samples: usize) -> Result<Samples, String> {
-        if rho.mat.shape() != (1 << self.qubits, 1 << self.qubits) {
+        let n = match &rho.mat {
+            Mixed(m) => {
+                let (a, b) = m.shape();
+                if a != b {
+                    return Err(format!(
+                        "Expected square density matrix but found {:?}",
+                        m.shape()
+                    ));
+                }
+                a
+            }
+            Pure(v) => v.dim(),
+        };
+
+        if n != 1 << self.qubits {
             return Err(format!(
                 "Expected shape {:?} but found {:?}",
-                (1 << self.qubits, 1 << self.qubits),
-                rho.mat.shape()
+                1 << self.qubits,
+                n
             ));
         }
+
         let samples = (0..samples)
             .into_par_iter()
             .map(|_| {
@@ -77,8 +95,31 @@ impl Experiment {
                 let u = kron_helper(ops);
                 let s = make_perm::<Complex<f64>>(&perm);
                 let f = rng.gen();
-                let i = measure_channel(self.qubits, &u, &s, &rho.mat, f);
-                debug_assert_eq!(i, measure_channel_dumb(&u, &s, &rho.mat, f));
+                let i = match &rho.mat {
+                    Mixed(m) => {
+                        let i = measure_channel(self.qubits, &u, &s, m, f);
+                        // Check same as dumb
+                        debug_assert_eq!(i, measure_channel_dumb(&u, &s, m, f));
+                        i
+                    }
+                    Pure(v) => {
+                        let i = measure_channel_pure(self.qubits, &u, &s, v, f);
+                        // Check same as dumb
+                        debug_assert!({
+                            let mut a = TriMat::new((v.dim(), v.dim()));
+                            v.into_sparse_vec_iter().for_each(|(i, ci)| {
+                                v.into_sparse_vec_iter().for_each(|(j, cj)| {
+                                    a.add_triplet(i, j, ci * cj.conj());
+                                });
+                            });
+                            let m = a.to_csr();
+                            let newi = measure_channel_dumb(&u, &s, &m, f);
+                            i == newi
+                        });
+                        i
+                    }
+                };
+
                 Sample::new(opis, perm, i)
             })
             .collect::<Vec<_>>();
@@ -111,6 +152,31 @@ impl Experiment {
     }
 }
 
+// Performs best when u and s are csr
+fn measure_channel_pure(
+    qubits: usize,
+    u: &CsMat<Complex<f64>>,
+    s: &CsMat<Complex<f64>>,
+    rho: &CsVec<Complex<f64>>,
+    mut random_float: f64,
+) -> usize {
+    debug_assert!(random_float >= 0.0);
+    debug_assert!(random_float <= 1.0);
+    for i in 0..1 << qubits {
+        let b = make_sprs_onehot(i, 1 << qubits);
+        let bus = b.mul(u).mul(s);
+        let busp = bus.dot(rho);
+        let p = busp.norm_sqr();
+
+        random_float -= p;
+        if random_float <= 0.0 {
+            return i;
+        }
+    }
+    (1 << qubits) - 1
+}
+
+// Performs best when u, s, rho are csr
 fn measure_channel(
     qubits: usize,
     u: &CsMat<Complex<f64>>,
@@ -118,19 +184,16 @@ fn measure_channel(
     rho: &CsMat<Complex<f64>>,
     mut random_float: f64,
 ) -> usize {
+    debug_assert!(random_float >= 0.0);
+    debug_assert!(random_float <= 1.0);
     for i in 0..1 << qubits {
         let b = make_sprs_onehot(i, 1 << qubits);
-        debug_assert_eq!(b.shape(), (1, 1 << qubits));
         let bus = b.mul(u).mul(s);
-        debug_assert_eq!(bus.shape(), (1, 1 << qubits));
-        let mut bust = bus.clone().transpose_into();
-        bust.data_mut().iter_mut().for_each(|c| *c = c.conj());
-        debug_assert_eq!(bust.shape(), (1 << qubits, 1));
-        let buspsub = bus.mul(rho).mul(&bust);
-        debug_assert_eq!(buspsub.shape(), (1, 1));
-        let x = buspsub.get(0, 0).copied().unwrap_or(Complex::<f64>::zero());
-        debug_assert!(x.im < 1e-10);
-        random_float -= x.re;
+        let mut bust = bus.clone();
+        bust.iter_mut().for_each(|(_, c)| *c = c.conj());
+        let buspsub = bus.mul(rho).dot(&bust);
+        debug_assert!(buspsub.im < 1e-10);
+        random_float -= buspsub.re;
         if random_float <= 0.0 {
             return i;
         }
@@ -144,6 +207,8 @@ fn measure_channel_dumb(
     rho: &CsMat<Complex<f64>>,
     mut random_float: f64,
 ) -> usize {
+    debug_assert!(random_float >= 0.0);
+    debug_assert!(random_float <= 1.0);
     let mut udag = u.clone().transpose_into();
     udag.data_mut().iter_mut().for_each(|x| *x = x.conj());
 
@@ -161,9 +226,14 @@ fn measure_channel_dumb(
     diag.len() - 1
 }
 
+pub enum DensityType {
+    Mixed(CsMat<Complex<f64>>),
+    Pure(CsVec<Complex<f64>>),
+}
+
 #[pyclass]
 pub struct DensityMatrix {
-    mat: CsMat<Complex<f64>>,
+    mat: DensityType,
 }
 
 #[pymethods]
@@ -183,7 +253,23 @@ impl DensityMatrix {
         let vi = coe_slice.iter();
         let i = ri.zip(ci.zip(vi)).map(|(a, (b, c))| (*a, *b, *c));
         let mat = Self::make_sprs(n, i);
-        Self { mat }
+        Self { mat: Mixed(mat) }
+    }
+
+    #[staticmethod]
+    fn new_pure_dense(arr: PyReadonlyArray1<Complex<f64>>, tol: Option<f64>) -> Self {
+        let tol = tol.unwrap_or(1e-10);
+        let arr = arr.as_array();
+        let n = arr.len();
+        let (indices, data) = arr
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, c)| c.norm() >= tol)
+            .unzip();
+
+        let v = CsVec::new(n, indices, data);
+        Self { mat: Pure(v) }
     }
 
     #[staticmethod]
@@ -197,7 +283,9 @@ impl DensityMatrix {
                 a.add_triplet(row, col, *v)
             }
         });
-        Self { mat: a.to_csr() }
+        Self {
+            mat: Mixed(a.to_csr()),
+        }
     }
 
     fn expectation(&self, op: &Operator) -> PyResult<Complex<f64>> {
@@ -222,21 +310,38 @@ impl DensityMatrix {
 
 impl DensityMatrix {
     fn expectation_opstring(&self, opstring: &OperatorString) -> Result<Complex<f64>, String> {
-        let mat = opstring.make_matrix();
-        if mat.shape() != self.mat.shape() {
-            Err(format!(
-                "Expected operator of size {:?} but found {:?}",
-                self.mat.shape(),
-                mat.shape()
-            ))
-        } else {
-            let s = mat
-                .mul(&self.mat)
-                .diag()
-                .iter()
-                .map(|(_, c)| c)
-                .sum::<Complex<f64>>();
-            Ok(s)
+        let opmat = opstring.make_matrix();
+        match &self.mat {
+            Mixed(m) => {
+                if opmat.shape() != m.shape() {
+                    Err(format!(
+                        "Expected operator of size {:?} but found {:?}",
+                        m.shape(),
+                        opmat.shape()
+                    ))
+                } else {
+                    let s = opmat
+                        .mul(m)
+                        .diag()
+                        .iter()
+                        .map(|(_, c)| c)
+                        .sum::<Complex<f64>>();
+                    Ok(s)
+                }
+            }
+            Pure(v) => {
+                if opmat.shape().0 != v.dim() {
+                    Err(format!(
+                        "Expected operator of size ({}, {}) but found {:?}",
+                        v.dim(),
+                        v.dim(),
+                        opmat.shape()
+                    ))
+                } else {
+                    let s = opmat.mul(v).iter().map(|(_, c)| c).sum::<Complex<f64>>();
+                    Ok(s)
+                }
+            }
         }
     }
 
@@ -269,6 +374,16 @@ impl Samples {
         let mut rng = thread_rng();
         let subset = self.samples.choose_multiple(&mut rng, n).cloned().collect();
         Self { samples: subset }
+    }
+
+    fn add_from(&mut self, other: &Samples) {
+        self.samples.extend(other.samples.iter().cloned());
+    }
+
+    fn combine(&self, other: &Samples) -> Self {
+        let mut samples = self.samples.clone();
+        samples.extend(other.samples.iter().cloned());
+        Self { samples }
     }
 
     fn num_samples(&self) -> usize {
@@ -347,7 +462,11 @@ mod tests {
 
     impl DensityMatrix {
         fn new_raw(mat: CsMat<Complex<f64>>) -> Self {
-            Self { mat }
+            Self { mat: Mixed(mat) }
+        }
+
+        fn new_raw_pure(mat: CsVec<Complex<f64>>) -> Self {
+            Self { mat: Pure(mat) }
         }
     }
 
@@ -382,33 +501,25 @@ mod tests {
         let ua = CsMat::eye(1 << 2);
         let ub = x_flip_num();
         let u = kronecker_product(ua.view(), ub.view());
-        let b = make_sprs_onehot::<Complex<f64>>(0b0001, 1 << qubits).transpose_into();
+        let b = make_sprs_onehot::<Complex<f64>>(0b0001, 1 << qubits);
         let u_on_b = u.mul(&b).to_dense();
-        let bb = make_sprs_onehot::<Complex<f64>>(0b0010, 1 << qubits)
-            .transpose_into()
-            .to_dense();
+        let bb = make_sprs_onehot::<Complex<f64>>(0b0010, 1 << qubits).to_dense();
         assert_eq!(bb, u_on_b);
 
-        let b = make_sprs_onehot::<Complex<f64>>(0b1000, 1 << qubits).transpose_into();
+        let b = make_sprs_onehot::<Complex<f64>>(0b1000, 1 << qubits);
         let u_on_b = u.mul(&b).to_dense();
-        let bb = make_sprs_onehot::<Complex<f64>>(0b1000, 1 << qubits)
-            .transpose_into()
-            .to_dense();
+        let bb = make_sprs_onehot::<Complex<f64>>(0b1000, 1 << qubits).to_dense();
         assert_eq!(bb, u_on_b);
 
         let u = kronecker_product(ub.view(), ua.view());
-        let b = make_sprs_onehot::<Complex<f64>>(0b0001, 1 << qubits).transpose_into();
+        let b = make_sprs_onehot::<Complex<f64>>(0b0001, 1 << qubits);
         let u_on_b = u.mul(&b).to_dense();
-        let bb = make_sprs_onehot::<Complex<f64>>(0b0001, 1 << qubits)
-            .transpose_into()
-            .to_dense();
+        let bb = make_sprs_onehot::<Complex<f64>>(0b0001, 1 << qubits).to_dense();
         assert_eq!(bb, u_on_b);
 
-        let b = make_sprs_onehot::<Complex<f64>>(0b1000, 1 << qubits).transpose_into();
+        let b = make_sprs_onehot::<Complex<f64>>(0b1000, 1 << qubits);
         let u_on_b = u.mul(&b).to_dense();
-        let bb = make_sprs_onehot::<Complex<f64>>(0b0100, 1 << qubits)
-            .transpose_into()
-            .to_dense();
+        let bb = make_sprs_onehot::<Complex<f64>>(0b0100, 1 << qubits).to_dense();
         assert_eq!(bb, u_on_b);
     }
 
@@ -616,6 +727,25 @@ mod tests {
         let exp = Experiment::new_raw(qubits, Some(flat_paulis), None);
 
         let rho = DensityMatrix::new_raw(rho);
+        let _samples = exp.sample_raw(&rho, 1000)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_sampling_pure() -> Result<(), String> {
+        let qubits = 4;
+        let rho = CsVec::new(
+            1 << qubits,
+            (0..1 << qubits).collect(),
+            vec![Complex::one(); 1 << qubits],
+        );
+
+        let pauli_pairs = make_numcons_pauli_pairs();
+        let flat_paulis = pauli_pairs.into_shape((16, 4, 4)).unwrap();
+        let exp = Experiment::new_raw(qubits, Some(flat_paulis), None);
+
+        let rho = DensityMatrix::new_raw_pure(rho);
         let _samples = exp.sample_raw(&rho, 1000)?;
 
         Ok(())

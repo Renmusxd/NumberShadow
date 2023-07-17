@@ -5,7 +5,7 @@ use numpy::ndarray::{Array2, Array4, ArrayView2, Axis};
 use pyo3::prelude::*;
 use pyo3::types::IntoPyDict;
 use pyo3::Python;
-use sprs::{kronecker_product, CsMat, TriMat};
+use sprs::{kronecker_product, CsMat, CsVec, TriMat};
 use std::ops::Add;
 
 pub fn permute_bits(input: usize, perm: &[usize]) -> usize {
@@ -28,13 +28,11 @@ where
     a.to_csr()
 }
 
-pub fn make_sprs_onehot<P>(i: usize, n: usize) -> CsMat<P>
+pub fn make_sprs_onehot<P>(i: usize, n: usize) -> CsVec<P>
 where
     P: Clone + Add<Output = P> + One,
 {
-    let mut a = TriMat::new((1, n));
-    a.add_triplet(0, i, P::one());
-    a.to_csr()
+    CsVec::new(n, vec![i], vec![P::one()])
 }
 
 pub fn make_perm<P>(perm: &[usize]) -> CsMat<P>
