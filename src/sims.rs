@@ -338,7 +338,9 @@ impl DensityMatrix {
                         opmat.shape()
                     ))
                 } else {
-                    let s = opmat.mul(v).iter().map(|(_, c)| c).sum::<Complex<f64>>();
+                    let mut cv = v.clone();
+                    cv.iter_mut().for_each(|(_, c)| *c = c.conj());
+                    let s = opmat.mul(v).dot(&cv);
                     Ok(s)
                 }
             }
