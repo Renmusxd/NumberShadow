@@ -72,6 +72,78 @@ impl Reconstruction {
         }
     }
 
+    fn filter_estimate_operator_string(
+        &self,
+        op: String,
+        samples: &Samples,
+    ) -> PyResult<Complex<f64>> {
+        let mut new_op = Operator::new();
+        new_op
+            .add_string_rust(Complex::<f64>::one(), op, None)
+            .map_err(PyValueError::new_err)?;
+        Ok(self.filter_estimate_operator(&new_op, samples))
+    }
+
+    fn filter_estimate_operator(&self, op: &Operator, samples: &Samples) -> Complex<f64> {
+        let pauli_pairs = make_numcons_pauli_pairs();
+
+        let acc = op
+            .opstrings
+            .iter()
+            .map(|(op_weight, ps)| -> Complex<f64> {
+                // For each operator substring, estimate it using the relevant permutations.
+                let (tot, count) = samples
+                    .samples
+                    .par_iter()
+                    .filter_map(|sample: &Sample| -> Option<(Complex<f64>, usize)> {
+                        let mut perm_inv = sample.perm.clone();
+                        for (i, k) in sample.perm.iter().enumerate() {
+                            perm_inv[*k] = i;
+                        }
+                        let channel_weight = (0..sample.perm.len() / 2)
+                            .map(|pair_index| {
+                                let site_a = perm_inv[2 * pair_index];
+                                let site_b = perm_inv[2 * pair_index + 1];
+
+                                let pauli_a = ps.get(site_a);
+                                let pauli_b = ps.get(site_b);
+
+                                match (pauli_a, pauli_b) {
+                                    (OpChar::Plus, OpChar::Minus)
+                                    | (OpChar::Minus, OpChar::Plus) => 1. / 3.,
+                                    (OpChar::Plus, _)
+                                    | (OpChar::Minus, _)
+                                    | (_, OpChar::Plus)
+                                    | (_, OpChar::Minus) => 0.0,
+                                    (OpChar::Z, OpChar::Z) | (OpChar::I, OpChar::I) => 1.0,
+                                    // For now, ignore mixed ZI
+                                    (OpChar::Z, OpChar::I) | (OpChar::I, OpChar::Z) => 0.0,
+                                }
+                            })
+                            .product::<f64>();
+                        if channel_weight.abs() < f64::EPSILON {
+                            None
+                        } else {
+                            let sub_acc = estimate_string_for_sample(
+                                ps,
+                                sample,
+                                pauli_pairs.view(),
+                                self.pairwise_ops.view(),
+                            );
+                            Some((sub_acc / channel_weight, 1))
+                        }
+                    })
+                    .reduce(
+                        || (Complex::<f64>::zero(), 0),
+                        |(ac, ai), (bc, bi)| (ac + bc, ai + bi),
+                    );
+
+                (*op_weight) * tot / (count as f64)
+            })
+            .sum::<Complex<f64>>();
+        acc
+    }
+
     fn estimate_operator_string(&self, op: String, samples: &Samples) -> PyResult<Complex<f64>> {
         let mut new_op = Operator::new();
         new_op
@@ -131,7 +203,6 @@ impl Reconstruction {
             })
             .sum::<Complex<f64>>();
         acc
-        // (acc.re, acc.im)
     }
 }
 
@@ -153,9 +224,6 @@ fn estimate_string_for_sample(
 
     (0..op_support / 2)
         .map(|pair_index| {
-            // let site_a = sample.perm[2 * pair_index];
-            // let site_b = sample.perm[2 * pair_index + 1];
-
             let site_a = perm_inv[2 * pair_index];
             let site_b = perm_inv[2 * pair_index + 1];
 
@@ -166,10 +234,6 @@ fn estimate_string_for_sample(
                 Complex::<f64>::one()
             } else {
                 // Get the 'local' measurement result.
-                // TODO check that we are indexing in the correct order.
-                // let bit_a = (sample.measurement >> (2 * pair_index)) & 1;
-                // let bit_b = (sample.measurement >> (2 * pair_index + 1)) & 1;
-
                 let bit_a = (ordered_meas >> (2 * pair_index)) & 1;
                 let bit_b = (ordered_meas >> (2 * pair_index + 1)) & 1;
 
@@ -209,9 +273,6 @@ fn filter_permutations(perm: &[usize], noni_indices: &[usize]) -> bool {
     }
 
     (0..perm.len() / 2).all(|pair_index| {
-        // let sia = perm[2 * pair_index];
-        // let sib = perm[2 * pair_index + 1];
-
         let sia = perm_inv[2 * pair_index];
         let sib = perm_inv[2 * pair_index + 1];
 
