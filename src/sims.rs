@@ -1,4 +1,4 @@
-use ndarray::{indices, Array1, ArrayView1};
+use ndarray::{Array1, ArrayView1};
 use num_traits::{One, PrimInt, Zero};
 use pyo3::{pyclass, pymethods, PyAny, PyResult, Python};
 use std::fs::File;
@@ -9,7 +9,7 @@ use std::path::Path;
 use crate::recon::Operator;
 use crate::sims::DensityType::{MixedSparse, PureDense, PureSparse};
 use crate::utils::{
-    kron_helper, make_dense_onehot, make_perm, make_sprs, make_sprs_onehot, scipy_mat,
+    kron_helper, make_perm, make_sprs, make_sprs_onehot, scipy_mat,
     OperatorString,
 };
 use num_complex::Complex;
