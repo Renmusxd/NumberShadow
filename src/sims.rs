@@ -1,5 +1,5 @@
 use ndarray::{indices, Array1, ArrayView1};
-use num_traits::Zero;
+use num_traits::{One, PrimInt, Zero};
 use pyo3::{pyclass, pymethods, PyAny, PyResult, Python};
 use std::fs::File;
 use std::io::{Read, Write};
@@ -360,6 +360,31 @@ impl DensityMatrix {
         OperatorString::try_from(opstring)
             .and_then(|x| self.expectation_opstring(&x))
             .map_err(PyValueError::new_err)
+    }
+
+    // Helper constructors
+    #[staticmethod]
+    fn new_uniform_in_sector_sprs(qubits: usize, sector: u32) -> Self {
+        let indices = (0..1usize << qubits)
+            .into_par_iter()
+            .filter(|i| i.count_ones() == sector)
+            .collect::<Vec<_>>();
+        let n = indices.len();
+        let f = (n as f64).sqrt();
+        let v = CsVec::new(1 << qubits, indices, vec![Complex::one() / f; n]);
+        Self { mat: PureSparse(v) }
+    }
+
+    #[staticmethod]
+    fn new_uniform_in_sector_dense(qubits: usize, sector: u32) -> Self {
+        let mut v = Array1::zeros((1 << qubits,));
+        let indices = (0..1usize << qubits)
+            .into_par_iter()
+            .filter(|i| i.count_ones() == sector)
+            .collect::<Vec<_>>();
+        let f = (indices.len() as f64).sqrt();
+        indices.into_iter().for_each(|i| v[i] = Complex::one() / f);
+        Self { mat: PureDense(v) }
     }
 }
 
