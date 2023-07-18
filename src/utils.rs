@@ -1,3 +1,4 @@
+use ndarray::Array1;
 use num_complex::Complex;
 use num_traits::{One, Zero};
 use numpy::ndarray;
@@ -33,6 +34,15 @@ where
     P: Clone + Add<Output = P> + One,
 {
     CsVec::new(n, vec![i], vec![P::one()])
+}
+
+pub fn make_dense_onehot<P>(i: usize, n: usize) -> Array1<P>
+where
+    P: One + Clone + Zero,
+{
+    let mut arr = Array1::zeros((n,));
+    arr[i] = P::one();
+    arr
 }
 
 pub fn make_perm<P>(perm: &[usize]) -> CsMat<P>

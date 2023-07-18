@@ -1,4 +1,4 @@
-use ndarray::indices;
+use ndarray::{indices, Array1, ArrayView1};
 use num_traits::Zero;
 use pyo3::{pyclass, pymethods, PyAny, PyResult, Python};
 use std::fs::File;
@@ -7,9 +7,10 @@ use std::ops::Mul;
 use std::path::Path;
 
 use crate::recon::Operator;
-use crate::sims::DensityType::{Mixed, Pure};
+use crate::sims::DensityType::{MixedSparse, PureDense, PureSparse};
 use crate::utils::{
-    kron_helper, make_perm, make_sprs, make_sprs_onehot, scipy_mat, OperatorString,
+    kron_helper, make_dense_onehot, make_perm, make_sprs, make_sprs_onehot, scipy_mat,
+    OperatorString,
 };
 use num_complex::Complex;
 use numpy::ndarray::{Array2, Array3, Axis};
@@ -45,7 +46,7 @@ impl Experiment {
 impl Experiment {
     fn sample_raw(&self, rho: &DensityMatrix, samples: usize) -> Result<Samples, String> {
         let n = match &rho.mat {
-            Mixed(m) => {
+            MixedSparse(m) => {
                 let (a, b) = m.shape();
                 if a != b {
                     return Err(format!(
@@ -55,7 +56,8 @@ impl Experiment {
                 }
                 a
             }
-            Pure(v) => v.dim(),
+            PureSparse(v) => v.dim(),
+            PureDense(v) => v.shape()[0],
         };
 
         if n != 1 << self.qubits {
@@ -96,13 +98,13 @@ impl Experiment {
                 let s = make_perm::<Complex<f64>>(&perm);
                 let f = rng.gen();
                 let i = match &rho.mat {
-                    Mixed(m) => {
+                    MixedSparse(m) => {
                         let i = measure_channel(self.qubits, &u, &s, m, f);
                         // Check same as dumb
                         debug_assert_eq!(i, measure_channel_dumb(&u, &s, m, f));
                         i
                     }
-                    Pure(v) => {
+                    PureSparse(v) => {
                         let i = measure_channel_pure(self.qubits, &u, &s, v, f);
                         // Check same as dumb
                         debug_assert!({
@@ -110,6 +112,24 @@ impl Experiment {
                             v.into_sparse_vec_iter().for_each(|(i, ci)| {
                                 v.into_sparse_vec_iter().for_each(|(j, cj)| {
                                     a.add_triplet(i, j, ci * cj.conj());
+                                });
+                            });
+                            let m = a.to_csr();
+                            let newi = measure_channel_dumb(&u, &s, &m, f);
+                            i == newi
+                        });
+                        i
+                    }
+                    PureDense(v) => {
+                        let i = measure_channel_pure_dense(self.qubits, &u, &s, v.view(), f);
+                        // Check same as dumb
+                        debug_assert!({
+                            let mut a = TriMat::new((v.shape()[0], v.shape()[0]));
+                            v.iter().enumerate().for_each(|(i, ci)| {
+                                v.iter().enumerate().for_each(|(j, cj)| {
+                                    if (ci * cj.conj()).norm() > 1e-10 {
+                                        a.add_triplet(i, j, ci * cj.conj());
+                                    }
                                 });
                             });
                             let m = a.to_csr();
@@ -176,6 +196,30 @@ fn measure_channel_pure(
     (1 << qubits) - 1
 }
 
+// Performs best when u and s are csr
+fn measure_channel_pure_dense(
+    qubits: usize,
+    u: &CsMat<Complex<f64>>,
+    s: &CsMat<Complex<f64>>,
+    rho: ArrayView1<Complex<f64>>,
+    mut random_float: f64,
+) -> usize {
+    debug_assert!(random_float >= 0.0);
+    debug_assert!(random_float <= 1.0);
+    for i in 0..1 << qubits {
+        let sp = s.mul(&rho);
+        let usp = u.mul(&sp);
+        let busp = usp[i];
+        let p = busp.norm_sqr();
+
+        random_float -= p;
+        if random_float <= 0.0 {
+            return i;
+        }
+    }
+    (1 << qubits) - 1
+}
+
 // Performs best when u, s, rho are csr
 fn measure_channel(
     qubits: usize,
@@ -227,8 +271,9 @@ fn measure_channel_dumb(
 }
 
 pub enum DensityType {
-    Mixed(CsMat<Complex<f64>>),
-    Pure(CsVec<Complex<f64>>),
+    MixedSparse(CsMat<Complex<f64>>),
+    PureSparse(CsVec<Complex<f64>>),
+    PureDense(Array1<Complex<f64>>),
 }
 
 #[pyclass]
@@ -253,11 +298,13 @@ impl DensityMatrix {
         let vi = coe_slice.iter();
         let i = ri.zip(ci.zip(vi)).map(|(a, (b, c))| (*a, *b, *c));
         let mat = Self::make_sprs(n, i);
-        Self { mat: Mixed(mat) }
+        Self {
+            mat: MixedSparse(mat),
+        }
     }
 
     #[staticmethod]
-    fn new_pure_dense(arr: PyReadonlyArray1<Complex<f64>>, tol: Option<f64>) -> Self {
+    fn new_pure_sparse(arr: PyReadonlyArray1<Complex<f64>>, tol: Option<f64>) -> Self {
         let tol = tol.unwrap_or(1e-10);
         let arr = arr.as_array();
         let n = arr.len();
@@ -269,11 +316,19 @@ impl DensityMatrix {
             .unzip();
 
         let v = CsVec::new(n, indices, data);
-        Self { mat: Pure(v) }
+        Self { mat: PureSparse(v) }
     }
 
     #[staticmethod]
-    fn from_dense(arr: PyReadonlyArray2<Complex<f64>>, tol: Option<f64>) -> Self {
+    fn new_pure_dense(arr: PyReadonlyArray1<Complex<f64>>) -> Self {
+        let arr = arr.as_array().to_owned();
+        Self {
+            mat: PureDense(arr),
+        }
+    }
+
+    #[staticmethod]
+    fn new_mixed_sparse(arr: PyReadonlyArray2<Complex<f64>>, tol: Option<f64>) -> Self {
         let tol = tol.unwrap_or(1e-10);
         let arr = arr.as_array();
 
@@ -284,7 +339,7 @@ impl DensityMatrix {
             }
         });
         Self {
-            mat: Mixed(a.to_csr()),
+            mat: MixedSparse(a.to_csr()),
         }
     }
 
@@ -312,7 +367,7 @@ impl DensityMatrix {
     fn expectation_opstring(&self, opstring: &OperatorString) -> Result<Complex<f64>, String> {
         let opmat = opstring.make_matrix();
         match &self.mat {
-            Mixed(m) => {
+            MixedSparse(m) => {
                 if opmat.shape() != m.shape() {
                     Err(format!(
                         "Expected operator of size {:?} but found {:?}",
@@ -329,7 +384,7 @@ impl DensityMatrix {
                     Ok(s)
                 }
             }
-            Pure(v) => {
+            PureSparse(v) => {
                 if opmat.shape().0 != v.dim() {
                     Err(format!(
                         "Expected operator of size ({}, {}) but found {:?}",
@@ -340,6 +395,21 @@ impl DensityMatrix {
                 } else {
                     let mut cv = v.clone();
                     cv.iter_mut().for_each(|(_, c)| *c = c.conj());
+                    let s = opmat.mul(v).dot(&cv);
+                    Ok(s)
+                }
+            }
+            PureDense(v) => {
+                if opmat.shape().0 != v.shape()[0] {
+                    Err(format!(
+                        "Expected operator of size ({}, {}) but found {:?}",
+                        v.dim(),
+                        v.dim(),
+                        opmat.shape()
+                    ))
+                } else {
+                    let mut cv = v.clone();
+                    cv.iter_mut().for_each(|c| *c = c.conj());
                     let s = opmat.mul(v).dot(&cv);
                     Ok(s)
                 }
@@ -464,11 +534,21 @@ mod tests {
 
     impl DensityMatrix {
         fn new_raw(mat: CsMat<Complex<f64>>) -> Self {
-            Self { mat: Mixed(mat) }
+            Self {
+                mat: MixedSparse(mat),
+            }
         }
 
         fn new_raw_pure(mat: CsVec<Complex<f64>>) -> Self {
-            Self { mat: Pure(mat) }
+            Self {
+                mat: PureSparse(mat),
+            }
+        }
+
+        fn new_raw_pure_dense(mat: Array1<Complex<f64>>) -> Self {
+            Self {
+                mat: PureDense(mat),
+            }
         }
     }
 
@@ -748,6 +828,26 @@ mod tests {
         let exp = Experiment::new_raw(qubits, Some(flat_paulis), None);
 
         let rho = DensityMatrix::new_raw_pure(rho);
+        let _samples = exp.sample_raw(&rho, 1000)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_sampling_pure_dense() -> Result<(), String> {
+        let qubits = 4;
+        let rho = CsVec::new(
+            1 << qubits,
+            (0..1 << qubits).collect(),
+            vec![Complex::one(); 1 << qubits],
+        );
+        let rho = rho.to_dense();
+
+        let pauli_pairs = make_numcons_pauli_pairs();
+        let flat_paulis = pauli_pairs.into_shape((16, 4, 4)).unwrap();
+        let exp = Experiment::new_raw(qubits, Some(flat_paulis), None);
+
+        let rho = DensityMatrix::new_raw_pure_dense(rho);
         let _samples = exp.sample_raw(&rho, 1000)?;
 
         Ok(())
