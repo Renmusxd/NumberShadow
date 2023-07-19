@@ -7,7 +7,7 @@ use std::mem::swap;
 use std::ops::Mul;
 use std::path::Path;
 
-use crate::recon::Operator;
+use crate::recon::{filtered_channel_weight, Operator};
 use crate::sims::DensityType::{MixedSparse, PureDense, PureSparse};
 use crate::utils::{
     kron_helper, make_perm, make_sprs, make_sprs_onehot, scipy_mat, OperatorString,
@@ -613,6 +613,29 @@ impl Samples {
         file.read_to_end(&mut buf)
             .map_err(|e| PyValueError::new_err(format!("{:?}", e)))?;
         bincode::deserialize(&buf).map_err(|e| PyValueError::new_err(format!("{:?}", e)))
+    }
+
+    fn get_filtered_samples_for_op(&self, opstring: String) -> PyResult<Self> {
+        OperatorString::try_from(opstring)
+            .map(|ps| -> Self {
+                let new_samples = self
+                    .samples
+                    .iter()
+                    .filter(|sample| {
+                        let mut perm_inv = sample.perm.clone();
+                        for (i, k) in sample.perm.iter().enumerate() {
+                            perm_inv[*k] = i;
+                        }
+                        let cw = filtered_channel_weight(&ps, &perm_inv);
+                        cw.abs() > f64::EPSILON
+                    })
+                    .cloned()
+                    .collect();
+                Self {
+                    samples: new_samples,
+                }
+            })
+            .map_err(PyValueError::new_err)
     }
 }
 

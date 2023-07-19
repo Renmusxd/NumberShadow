@@ -49,7 +49,7 @@ impl Reconstruction {
             .unzip();
 
         let subop: OperatorString = noni_substring.into();
-        let cw = channel_weight(&subop);
+        let cw = unfiltered_channel_weight(&subop);
         if cw.abs() > f64::EPSILON {
             let samples = samples
                 .samples
@@ -100,27 +100,7 @@ impl Reconstruction {
                         for (i, k) in sample.perm.iter().enumerate() {
                             perm_inv[*k] = i;
                         }
-                        let channel_weight = (0..sample.perm.len() / 2)
-                            .map(|pair_index| {
-                                let site_a = perm_inv[2 * pair_index];
-                                let site_b = perm_inv[2 * pair_index + 1];
-
-                                let pauli_a = ps.get(site_a);
-                                let pauli_b = ps.get(site_b);
-
-                                match (pauli_a, pauli_b) {
-                                    (OpChar::Plus, OpChar::Minus)
-                                    | (OpChar::Minus, OpChar::Plus) => 1. / 3.,
-                                    (OpChar::Plus, _)
-                                    | (OpChar::Minus, _)
-                                    | (_, OpChar::Plus)
-                                    | (_, OpChar::Minus) => 0.0,
-                                    (OpChar::Z, OpChar::Z) | (OpChar::I, OpChar::I) => 1.0,
-                                    // For now, ignore mixed ZI
-                                    (OpChar::Z, OpChar::I) | (OpChar::I, OpChar::Z) => 0.0,
-                                }
-                            })
-                            .product::<f64>();
+                        let channel_weight = filtered_channel_weight(ps, &perm_inv);
                         if channel_weight.abs() < f64::EPSILON {
                             None
                         } else {
@@ -176,7 +156,7 @@ impl Reconstruction {
                     .unzip();
 
                 let subop: OperatorString = noni_substring.into();
-                let cw = channel_weight(&subop);
+                let cw = unfiltered_channel_weight(&subop);
                 if cw.abs() < f64::EPSILON {
                     Complex::<f64>::zero()
                 } else {
@@ -280,7 +260,29 @@ fn filter_permutations(perm: &[usize], noni_indices: &[usize]) -> bool {
     })
 }
 
-fn channel_weight(opstring: &OperatorString) -> f64 {
+pub fn filtered_channel_weight(opstring: &OperatorString, perm_inv: &[usize]) -> f64 {
+    (0..perm_inv.len() / 2)
+        .map(|pair_index| {
+            let site_a = perm_inv[2 * pair_index];
+            let site_b = perm_inv[2 * pair_index + 1];
+
+            let pauli_a = opstring.get(site_a);
+            let pauli_b = opstring.get(site_b);
+
+            match (pauli_a, pauli_b) {
+                (OpChar::Plus, OpChar::Minus) | (OpChar::Minus, OpChar::Plus) => 1. / 3.,
+                (OpChar::Plus, _) | (OpChar::Minus, _) | (_, OpChar::Plus) | (_, OpChar::Minus) => {
+                    0.0
+                }
+                (OpChar::Z, OpChar::Z) | (OpChar::I, OpChar::I) => 1.0,
+                // For now, ignore mixed ZI
+                (OpChar::Z, OpChar::I) | (OpChar::I, OpChar::Z) => 0.0,
+            }
+        })
+        .product()
+}
+
+pub fn unfiltered_channel_weight(opstring: &OperatorString) -> f64 {
     let [count_z, count_p, count_m, count_i] = opstring.count_terms();
     let qubits = count_z + count_p + count_m + count_i;
     if count_i != 0 {
@@ -356,7 +358,7 @@ mod tests {
     #[test]
     fn check_weight_simple() -> Result<(), String> {
         let opstring = "ZZZZ".try_into()?;
-        let w = channel_weight(&opstring);
+        let w = unfiltered_channel_weight(&opstring);
 
         assert!((w - 1.0).abs() < 1e-10);
         Ok(())
@@ -365,7 +367,7 @@ mod tests {
     #[test]
     fn check_weight_pmpmpm() -> Result<(), String> {
         let opstring = "+-+-+-".try_into()?;
-        let w = channel_weight(&opstring);
+        let w = unfiltered_channel_weight(&opstring);
         assert!((w - 0.014814814814814815).abs() < 1e-10);
         Ok(())
     }
