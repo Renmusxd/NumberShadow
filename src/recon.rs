@@ -429,8 +429,6 @@ mod tests {
         let measured =
             estimate_string_for_sample(&opstring, &sample, pauli_pairs.view(), pairwise_ops.view());
 
-        dbg!(measured);
-
         Ok(())
     }
 }
