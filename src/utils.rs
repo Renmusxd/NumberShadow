@@ -123,6 +123,10 @@ pub struct OperatorString {
 }
 
 impl OperatorString {
+    pub fn make_matrices(&self) -> Vec<Array2<Complex<f64>>> {
+        self.opstring.iter().map(|c| c.get_matrix()).collect()
+    }
+
     pub fn make_matrix(&self) -> CsMat<Complex<f64>> {
         let cmats = self.opstring.iter().map(|c| {
             let m = c.get_matrix();

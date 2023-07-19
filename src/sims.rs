@@ -262,6 +262,26 @@ fn measure_channel_pure_dense(
     (1 << qubits) - 1
 }
 
+fn apply_ops<'a, OPS>(
+    qubits: usize,
+    ops: OPS,
+    mut a: &'a mut [Complex<f64>],
+    mut b: &'a mut [Complex<f64>],
+) where
+    OPS: IntoIterator<Item = MatrixOp<Complex<f64>>>,
+{
+    // b is the "input" to the ops, a is the arena.
+    for op in ops.into_iter() {
+        // b is the "input", the last thing written to.
+        swap(&mut a, &mut b);
+        // Now a is the input, we write to b
+        qip_iterators::matrix_ops::apply_op(qubits, &op, a, b, 0, 0);
+        // a is cleared, all needed data in b.
+        a.iter_mut().for_each(|x| *x = Complex::zero());
+        // b is last thing written to, "input" for next stage.
+    }
+}
+
 // Performs best when u, s, rho are csr
 fn measure_channel(
     qubits: usize,
@@ -436,9 +456,9 @@ impl DensityMatrix {
 
 impl DensityMatrix {
     fn expectation_opstring(&self, opstring: &OperatorString) -> Result<Complex<f64>, String> {
-        let opmat = opstring.make_matrix();
         match &self.mat {
             MixedSparse(m) => {
+                let opmat = opstring.make_matrix();
                 if opmat.shape() != m.shape() {
                     Err(format!(
                         "Expected operator of size {:?} but found {:?}",
@@ -456,6 +476,7 @@ impl DensityMatrix {
                 }
             }
             PureSparse(v) => {
+                let opmat = opstring.make_matrix();
                 if opmat.shape().0 != v.dim() {
                     Err(format!(
                         "Expected operator of size ({}, {}) but found {:?}",
@@ -471,17 +492,44 @@ impl DensityMatrix {
                 }
             }
             PureDense(v) => {
-                if opmat.shape().0 != v.shape()[0] {
+                let nqubits = opstring.opstring.len();
+                if 1 << nqubits != v.shape()[0] {
                     Err(format!(
                         "Expected operator of size ({}, {}) but found {:?}",
                         v.dim(),
                         v.dim(),
-                        opmat.shape()
+                        1 << nqubits
                     ))
                 } else {
+                    let ops = opstring
+                        .make_matrices()
+                        .iter()
+                        .enumerate()
+                        .map(|(i, op)| {
+                            MatrixOp::new_matrix([i], op.iter().copied().collect::<Vec<_>>())
+                        })
+                        .collect::<Vec<_>>();
+
                     let mut cv = v.clone();
-                    cv.iter_mut().for_each(|c| *c = c.conj());
-                    let s = opmat.mul(v).dot(&cv);
+                    let mut cv_arena = v.clone();
+                    apply_ops(
+                        nqubits,
+                        ops,
+                        cv.as_slice_mut().unwrap(),
+                        cv_arena.as_slice_mut().unwrap(),
+                    );
+
+                    cv.iter_mut().zip(v.iter()).for_each(|(a, b)| *a = b.conj());
+                    let s = cv_arena.dot(&cv);
+
+                    debug_assert!({
+                        let opmat = opstring.make_matrix();
+                        let mut cv = v.clone();
+                        cv.iter_mut().for_each(|c| *c = c.conj());
+                        let news = opmat.mul(v).dot(&cv);
+                        (s - news).norm() < f64::EPSILON
+                    });
+
                     Ok(s)
                 }
             }
@@ -925,6 +973,17 @@ mod tests {
         let f = rng.gen();
         let newi = measure_channel_pure_dense(qubits, &ops, &s, rho.view(), f);
         assert_eq!(newi, 0b0110);
+    }
+
+    #[test]
+    fn test_expectation() -> Result<(), String> {
+        let qubits = 4;
+        let rho = DensityMatrix::new_raw_pure_dense(Array1::ones((1 << qubits,)));
+
+        let opstring = OperatorString::try_new("ZZZZ".chars())?;
+        rho.expectation_opstring(&opstring)?;
+
+        Ok(())
     }
 
     #[test]
