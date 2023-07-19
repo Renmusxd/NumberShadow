@@ -3,6 +3,7 @@ use num_traits::{One, Zero};
 use pyo3::{pyclass, pymethods, PyAny, PyResult, Python};
 use std::fs::File;
 use std::io::{Read, Write};
+use std::mem::swap;
 use std::ops::Mul;
 use std::path::Path;
 
@@ -15,6 +16,7 @@ use num_complex::Complex;
 use numpy::ndarray::{Array2, Array3, Axis};
 use numpy::{ndarray, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3};
 use pyo3::exceptions::PyValueError;
+use qip_iterators::iterators::MatrixOp;
 use rand::prelude::*;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -70,7 +72,7 @@ impl Experiment {
         let samples = (0..samples)
             .into_par_iter()
             .map(|_| {
-                let mut rng = rand::thread_rng();
+                let mut rng = thread_rng();
                 let mut perm: Vec<_> = (0..self.qubits).collect();
                 if let Some(perms) = &self.perms {
                     let i = rng.gen_range(0..perms.shape()[0]);
@@ -107,6 +109,10 @@ impl Experiment {
                     PureSparse(v) => {
                         let i = measure_channel_pure(self.qubits, &ops, &perm, v, f);
                         // Check same as dumb
+                        debug_assert_eq!(i, {
+                            let vv = v.to_dense();
+                            measure_channel_pure_dense(self.qubits, &ops, &perm, vv.view(), f)
+                        }, "Output from pure sparse measurement not the same as from dense measurement.");
                         debug_assert!({
                             let mut a = TriMat::new((v.dim(), v.dim()));
                             v.into_sparse_vec_iter().for_each(|(i, ci)| {
@@ -117,7 +123,7 @@ impl Experiment {
                             let m = a.to_csr();
                             let newi = measure_channel_dumb(&ops, &perm, &m, f);
                             i == newi
-                        });
+                        } , "Output from pure sparse measurement not the same as from dumb measurement.");
                         i
                     }
                     PureDense(v) => {
@@ -135,7 +141,7 @@ impl Experiment {
                             let m = a.to_csr();
                             let newi = measure_channel_dumb(&ops, &perm, &m, f);
                             i == newi
-                        });
+                        }, "Output from pure dense measurement not the same as from dumb measurement.");
                         i
                     }
                 };
@@ -213,12 +219,37 @@ fn measure_channel_pure_dense(
     rho: ArrayView1<Complex<f64>>,
     mut random_float: f64,
 ) -> usize {
-    let u = kron_helper(ops.iter().map(|op| make_sprs(*op)));
+    // let u = kron_helper(ops.iter().map(|op| make_sprs(*op)));
+    let ops = ops
+        .iter()
+        .enumerate()
+        .map(|(i, op)| {
+            MatrixOp::new_matrix([2 * i, 2 * i + 1], op.iter().copied().collect::<Vec<_>>())
+        })
+        .collect::<Vec<_>>();
     let s = make_perm::<Complex<f64>>(&perm);
     debug_assert!(random_float >= 0.0);
     debug_assert!(random_float <= 1.0);
-    let sp = s.mul(&rho);
-    let usp = u.mul(&sp);
+    let mut t_sp = s.mul(&rho);
+    let mut t_usp = Array1::zeros((t_sp.len(),));
+
+    // b is the "input" to the ops, a is the arena.
+    let mut b = t_sp.as_slice_mut().unwrap();
+    let mut a = t_usp.as_slice_mut().unwrap();
+
+    for op in ops.iter() {
+        // b is the "input", the last thing written to.
+        swap(&mut a, &mut b);
+        // Now a is the input, we write to b
+        qip_iterators::matrix_ops::apply_op(qubits, op, a, b, 0, 0);
+        // a is cleared, all needed data in b.
+        a.iter_mut().for_each(|x| *x = Complex::zero());
+        // b is last thing written to, "input" for next stage.
+    }
+
+    // Value in b represents application of ops to sp.
+    let usp = b;
+
     for i in 0..1 << qubits {
         let busp = usp[i];
         let p = busp.norm_sqr();
@@ -482,6 +513,10 @@ impl Samples {
         Self::default()
     }
 
+    fn get_perm_sizes(&self) -> Vec<usize> {
+        self.samples.iter().map(|x| x.perm.len()).collect()
+    }
+
     fn subset(&self, n: usize) -> Self {
         let mut rng = thread_rng();
         let subset = self.samples.choose_multiple(&mut rng, n).cloned().collect();
@@ -596,6 +631,11 @@ mod tests {
         let mut a = TriMat::new((1 << qubits, 1 << qubits));
         a.add_triplet(i, i, Complex::<f64>::one());
         a.to_csr()
+    }
+    fn make_simple_rho_dense(qubits: usize, i: usize) -> Array1<Complex<f64>> {
+        let mut arr = Array1::zeros((1 << qubits,));
+        arr[i] = Complex::one();
+        arr
     }
 
     fn make_mixed_rho(qubits: usize) -> CsMat<Complex<f64>> {
@@ -858,6 +898,36 @@ mod tests {
     }
 
     #[test]
+    fn check_sim_flip_dense() {
+        let qubits = 4;
+        let ua = Array2::eye(1 << 2);
+        let ub = x_flip_num().to_dense();
+        let ops = [ua.view(), ub.view()];
+        let s = [0, 1, 2, 3];
+        let rho = make_simple_rho_dense(qubits, 0b0001);
+        let mut rng = thread_rng();
+        let f = rng.gen();
+        let newi = measure_channel_pure_dense(qubits, &ops, &s, rho.view(), f);
+        assert_eq!(newi, 0b0010);
+
+        let ops = [ub.view(), ua.view()];
+        let rho = make_simple_rho_dense(qubits, 0b1000);
+        let mut rng = thread_rng();
+        let f = rng.gen();
+        let newi = measure_channel_pure_dense(qubits, &ops, &s, rho.view(), f);
+        assert_eq!(newi, 0b0100);
+
+        let s = [1, 0, 2, 3];
+
+        let ops = [ua.view(), ua.view()];
+        let rho = make_simple_rho_dense(qubits, 0b1010);
+        let mut rng = thread_rng();
+        let f = rng.gen();
+        let newi = measure_channel_pure_dense(qubits, &ops, &s, rho.view(), f);
+        assert_eq!(newi, 0b0110);
+    }
+
+    #[test]
     fn test_sampling() -> Result<(), String> {
         let qubits = 4;
         let mut rho = TriMat::<Complex<f64>>::new((1 << qubits, 1 << qubits));
@@ -905,6 +975,21 @@ mod tests {
             vec![Complex::one(); 1 << qubits],
         );
         let rho = rho.to_dense();
+
+        let pauli_pairs = make_numcons_pauli_pairs();
+        let flat_paulis = pauli_pairs.into_shape((16, 4, 4)).unwrap();
+        let exp = Experiment::new_raw(qubits, Some(flat_paulis), None);
+
+        let rho = DensityMatrix::new_raw_pure_dense(rho);
+        let _samples = exp.sample_raw(&rho, 1000)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_sampling_pure_dense_larger() -> Result<(), String> {
+        let qubits = 6;
+        let rho = Array1::ones((1 << qubits,));
 
         let pauli_pairs = make_numcons_pauli_pairs();
         let flat_paulis = pauli_pairs.into_shape((16, 4, 4)).unwrap();
