@@ -1,9 +1,10 @@
 use crate::sims::{Sample, Samples};
 use crate::utils::{fact, fact2, make_numcons_pauli_pairs, reverse_n_bits, OpChar, OperatorString};
+use ndarray::Array4;
 use num_complex::Complex;
 use num_traits::{One, ToPrimitive, Zero};
 use numpy::ndarray::{s, Array1, Array2, Array3, ArrayView3, ArrayView4};
-use numpy::{PyArray1, PyReadonlyArray3, ToPyArray};
+use numpy::{IntoPyArray, PyArray1, PyReadonlyArray3, ToPyArray};
 use pyo3::exceptions::PyValueError;
 use pyo3::types::PyComplex;
 use pyo3::{pyclass, pymethods, Py, PyResult, Python};
@@ -12,6 +13,101 @@ use rayon::prelude::*;
 #[pyclass]
 pub struct Reconstruction {
     pairwise_ops: Array3<Complex<f64>>,
+    pauli_pairs: Array4<Complex<f64>>,
+}
+
+impl Reconstruction {
+    fn estimate_operator_string(
+        &self,
+        ps: &OperatorString,
+        samples: &Samples,
+    ) -> (Complex<f64>, usize) {
+        // For each operator substring, estimate it using the relevant permutations.
+        let enumerating_indices = (0..ps.opstring.len()).collect::<Vec<_>>();
+        let available_indices = ps.indices.as_ref();
+        let iter_indices = if let Some(indices) = available_indices {
+            indices
+        } else {
+            &enumerating_indices
+        };
+
+        let (noni_indices, noni_substring): (Vec<_>, Vec<_>) = iter_indices
+            .iter()
+            .zip(ps.opstring.iter())
+            .filter(|(_, op)| OpChar::I.ne(op))
+            .map(|(a, b)| (*a, *b))
+            .unzip();
+
+        let subop: OperatorString = noni_substring.into();
+        let cw = unfiltered_channel_weight(&subop);
+        if cw.abs() < f64::EPSILON {
+            (Complex::<f64>::zero(), 0)
+        } else {
+            let (tot, count) = samples
+                .samples
+                .par_iter()
+                .filter(|sample| filter_permutations(&sample.perm, &noni_indices))
+                .map(|sample| -> (Complex<f64>, usize) {
+                    let sub_acc = estimate_string_for_sample(
+                        ps,
+                        sample,
+                        self.pauli_pairs.view(),
+                        self.pairwise_ops.view(),
+                    );
+                    (sub_acc, 1)
+                })
+                .reduce(
+                    || (Complex::<f64>::zero(), 0),
+                    |(ac, ai), (bc, bi)| (ac + bc, ai + bi),
+                );
+
+            (tot / (cw * count as f64), count)
+        }
+    }
+
+    fn filter_estimate_operator_string_iterator<'a>(
+        &'a self,
+        opstring: &'a OperatorString,
+        samples: &'a Samples,
+    ) -> impl ParallelIterator<Item = Complex<f64>> + 'a {
+        // For each operator substring, estimate it using the relevant permutations.
+        samples
+            .samples
+            .par_iter()
+            .filter_map(|sample: &Sample| -> Option<Complex<f64>> {
+                let mut perm_inv = sample.perm.clone();
+                for (i, k) in sample.perm.iter().enumerate() {
+                    perm_inv[*k] = i;
+                }
+                let channel_weight = filtered_channel_weight(opstring, &perm_inv);
+                if channel_weight.abs() < f64::EPSILON {
+                    None
+                } else {
+                    let sub_acc = estimate_string_for_sample(
+                        opstring,
+                        sample,
+                        self.pauli_pairs.view(),
+                        self.pairwise_ops.view(),
+                    );
+                    Some(sub_acc / channel_weight)
+                }
+            })
+    }
+
+    fn filter_estimate_operator_string(
+        &self,
+        opstring: &OperatorString,
+        samples: &Samples,
+    ) -> (Complex<f64>, usize) {
+        let (tot, count) = self
+            .filter_estimate_operator_string_iterator(opstring, samples)
+            .map(|c| (c, 1))
+            .reduce(
+                || (Complex::<f64>::zero(), 0),
+                |(ac, ai), (bc, bi)| (ac + bc, ai + bi),
+            );
+        (tot / (count as f64), count)
+    }
 }
 
 #[pymethods]
@@ -19,8 +115,12 @@ impl Reconstruction {
     #[new]
     fn new(ops: Option<PyReadonlyArray3<Complex<f64>>>) -> Self {
         let ops = ops.unwrap().as_array().to_owned();
+        let pauli_pairs = make_numcons_pauli_pairs();
 
-        Self { pairwise_ops: ops }
+        Self {
+            pairwise_ops: ops,
+            pauli_pairs,
+        }
     }
 
     fn estimate_string_for_each_sample(
@@ -30,8 +130,6 @@ impl Reconstruction {
         samples: &Samples,
     ) -> PyResult<Py<PyArray1<Complex<f64>>>> {
         let ps = OperatorString::try_new(op.chars()).map_err(PyValueError::new_err)?;
-
-        let pauli_pairs = make_numcons_pauli_pairs();
 
         let enumerating_indices = (0..ps.opstring.len()).collect::<Vec<_>>();
         let available_indices = ps.indices.as_ref();
@@ -59,7 +157,7 @@ impl Reconstruction {
                     let est = estimate_string_for_sample(
                         &ps,
                         sample,
-                        pauli_pairs.view(),
+                        self.pauli_pairs.view(),
                         self.pairwise_ops.view(),
                     );
                     est / cw
@@ -72,114 +170,56 @@ impl Reconstruction {
         }
     }
 
-    fn filter_estimate_operator_string(
+    /// Return each evaluation of the operator string for each counted sample
+    fn filter_evaluate_operator_string(
+        &self,
+        py: Python,
+        opstring: String,
+        samples: &Samples,
+    ) -> PyResult<Py<PyArray1<Complex<f64>>>> {
+        let opstring = OperatorString::try_from(opstring).map_err(PyValueError::new_err)?;
+        let tot = self
+            .filter_estimate_operator_string_iterator(&opstring, samples)
+            .collect::<Vec<Complex<f64>>>();
+        let tot = Array1::from_vec(tot);
+        let tot = tot.into_pyarray(py).to_owned();
+        Ok(tot)
+    }
+
+    /// Estimate the trace of the operator using the set of samples.
+    fn filter_estimate_string(
         &self,
         op: String,
         samples: &Samples,
-    ) -> PyResult<Complex<f64>> {
-        let mut new_op = Operator::new();
-        new_op
-            .add_string_rust(Complex::<f64>::one(), op, None)
-            .map_err(PyValueError::new_err)?;
-        Ok(self.filter_estimate_operator(&new_op, samples))
+    ) -> PyResult<(Complex<f64>, usize)> {
+        let opstring = OperatorString::try_from(op).map_err(PyValueError::new_err)?;
+        Ok(self.filter_estimate_operator_string(&opstring, samples))
     }
 
     fn filter_estimate_operator(&self, op: &Operator, samples: &Samples) -> Complex<f64> {
-        let pauli_pairs = make_numcons_pauli_pairs();
-
         let acc = op
             .opstrings
             .iter()
             .map(|(op_weight, ps)| -> Complex<f64> {
-                // For each operator substring, estimate it using the relevant permutations.
-                let (tot, count) = samples
-                    .samples
-                    .par_iter()
-                    .filter_map(|sample: &Sample| -> Option<(Complex<f64>, usize)> {
-                        let mut perm_inv = sample.perm.clone();
-                        for (i, k) in sample.perm.iter().enumerate() {
-                            perm_inv[*k] = i;
-                        }
-                        let channel_weight = filtered_channel_weight(ps, &perm_inv);
-                        if channel_weight.abs() < f64::EPSILON {
-                            None
-                        } else {
-                            let sub_acc = estimate_string_for_sample(
-                                ps,
-                                sample,
-                                pauli_pairs.view(),
-                                self.pairwise_ops.view(),
-                            );
-                            Some((sub_acc / channel_weight, 1))
-                        }
-                    })
-                    .reduce(
-                        || (Complex::<f64>::zero(), 0),
-                        |(ac, ai), (bc, bi)| (ac + bc, ai + bi),
-                    );
-
-                (*op_weight) * tot / (count as f64)
+                let (mean, _) = self.filter_estimate_operator_string(ps, samples);
+                (*op_weight) * mean
             })
             .sum::<Complex<f64>>();
         acc
     }
 
-    fn estimate_operator_string(&self, op: String, samples: &Samples) -> PyResult<Complex<f64>> {
-        let mut new_op = Operator::new();
-        new_op
-            .add_string_rust(Complex::<f64>::one(), op, None)
-            .map_err(PyValueError::new_err)?;
-        Ok(self.estimate_operator(&new_op, samples))
+    fn estimate_string(&self, op: String, samples: &Samples) -> PyResult<(Complex<f64>, usize)> {
+        let opstring = OperatorString::try_from(op).map_err(PyValueError::new_err)?;
+        Ok(self.estimate_operator_string(&opstring, samples))
     }
 
     fn estimate_operator(&self, op: &Operator, samples: &Samples) -> Complex<f64> {
-        let pauli_pairs = make_numcons_pauli_pairs();
-
         let acc = op
             .opstrings
             .iter()
             .map(|(op_weight, ps)| -> Complex<f64> {
-                // For each operator substring, estimate it using the relevant permutations.
-                let enumerating_indices = (0..ps.opstring.len()).collect::<Vec<_>>();
-                let available_indices = ps.indices.as_ref();
-                let iter_indices = if let Some(indices) = available_indices {
-                    indices
-                } else {
-                    &enumerating_indices
-                };
-
-                let (noni_indices, noni_substring): (Vec<_>, Vec<_>) = iter_indices
-                    .iter()
-                    .zip(ps.opstring.iter())
-                    .filter(|(_, op)| OpChar::I.ne(op))
-                    .map(|(a, b)| (*a, *b))
-                    .unzip();
-
-                let subop: OperatorString = noni_substring.into();
-                let cw = unfiltered_channel_weight(&subop);
-                if cw.abs() < f64::EPSILON {
-                    Complex::<f64>::zero()
-                } else {
-                    let (tot, count) = samples
-                        .samples
-                        .par_iter()
-                        .filter(|sample| filter_permutations(&sample.perm, &noni_indices))
-                        .map(|sample| -> (Complex<f64>, usize) {
-                            let sub_acc = estimate_string_for_sample(
-                                ps,
-                                sample,
-                                pauli_pairs.view(),
-                                self.pairwise_ops.view(),
-                            );
-                            (sub_acc, 1)
-                        })
-                        .reduce(
-                            || (Complex::<f64>::zero(), 0),
-                            |(ac, ai), (bc, bi)| (ac + bc, ai + bi),
-                        );
-
-                    (*op_weight) * tot / (cw * count as f64)
-                }
+                let (mean, _) = self.estimate_operator_string(ps, samples);
+                (*op_weight) * mean
             })
             .sum::<Complex<f64>>();
         acc
