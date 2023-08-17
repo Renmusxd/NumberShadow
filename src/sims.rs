@@ -27,19 +27,13 @@ use sprs::*;
 pub struct Experiment {
     qubits: usize,
     pairwise_ops: Array3<Complex<f64>>,
-    perms: Option<Array2<usize>>,
 }
 
 impl Experiment {
-    fn new_raw(
-        qubits: usize,
-        ops: Option<Array3<Complex<f64>>>,
-        perms: Option<Array2<usize>>,
-    ) -> Self {
+    fn new_raw(qubits: usize, ops: Option<Array3<Complex<f64>>>) -> Self {
         Self {
             qubits,
             pairwise_ops: ops.unwrap(),
-            perms,
         }
     }
 }
@@ -74,79 +68,39 @@ impl Experiment {
             .map(|_| {
                 let mut rng = thread_rng();
                 let mut perm: Vec<_> = (0..self.qubits).collect();
-                if let Some(perms) = &self.perms {
-                    let i = rng.gen_range(0..perms.shape()[0]);
-                    perm.iter_mut()
-                        .zip(perms.index_axis(Axis(0), i).iter())
-                        .for_each(|(a, b)| {
-                            *a = *b;
-                        });
-                } else {
-                    perm.shuffle(&mut rng);
-                };
+                perm.shuffle(&mut rng);
+
                 let opis = (0..self.qubits >> 1)
-                    .map(|_| rng.gen_range(0..self.pairwise_ops.shape()[0]))
+                    .map(|i| {
+                        (
+                            (perm[2 * i], perm[2 * i + 1]),
+                            rng.gen_range(0..self.pairwise_ops.shape()[0]),
+                        )
+                    })
                     .collect::<Vec<_>>();
 
                 // Now we have our permutation and our operator.
                 // Lets compute (U.U.U.U)S = US
-                let ops = opis
-                    .iter()
-                    .map(|opi| {
-                        let op = self.pairwise_ops.index_axis(Axis(0), *opi);
-                        op
-                    })
-                    .collect::<Vec<_>>();
-
                 let f = rng.gen();
                 let i = match &rho.mat {
                     MixedSparse(m) => {
-                        let i = measure_channel(self.qubits, &ops, &perm, m, f);
-                        // Check same as dumb
-                        debug_assert_eq!(i, measure_channel_dumb(&ops, &perm, m, f));
-                        i
+                        unimplemented!()
                     }
                     PureSparse(v) => {
-                        let i = measure_channel_pure(self.qubits, &ops, &perm, v, f);
-                        // Check same as dumb
-                        debug_assert_eq!(i, {
-                            let vv = v.to_dense();
-                            measure_channel_pure_dense(self.qubits, &ops, &perm, vv.view(), f)
-                        }, "Output from pure sparse measurement not the same as from dense measurement.");
-                        debug_assert!({
-                            let mut a = TriMat::new((v.dim(), v.dim()));
-                            v.into_sparse_vec_iter().for_each(|(i, ci)| {
-                                v.into_sparse_vec_iter().for_each(|(j, cj)| {
-                                    a.add_triplet(i, j, ci * cj.conj());
-                                });
-                            });
-                            let m = a.to_csr();
-                            let newi = measure_channel_dumb(&ops, &perm, &m, f);
-                            i == newi
-                        } , "Output from pure sparse measurement not the same as from dumb measurement.");
-                        i
+                        unimplemented!()
                     }
                     PureDense(v) => {
-                        let i = measure_channel_pure_dense(self.qubits, &ops, &perm, v.view(), f);
-                        // Check same as dumb
-                        debug_assert!({
-                            let mut a = TriMat::new((v.shape()[0], v.shape()[0]));
-                            v.iter().enumerate().for_each(|(i, ci)| {
-                                v.iter().enumerate().for_each(|(j, cj)| {
-                                    if (ci * cj.conj()).norm() > 1e-10 {
-                                        a.add_triplet(i, j, ci * cj.conj());
-                                    }
-                                });
-                            });
-                            let m = a.to_csr();
-                            let newi = measure_channel_dumb(&ops, &perm, &m, f);
-                            i == newi
-                        }, "Output from pure dense measurement not the same as from dumb measurement.");
+                        let ops_it = opis.iter().map(|((i, j), opi)| {
+                            let op = self.pairwise_ops.index_axis(Axis(0), *opi);
+                            ((*i, *j), op)
+                        });
+
+                        let i = measure_channel_pure_dense(self.qubits, ops_it, v.view(), f);
                         i
                     }
                 };
 
-                Sample::new(opis, perm, i)
+                Sample::new(opis, i.into())
             })
             .collect::<Vec<_>>();
         Ok(Samples { samples })
@@ -156,81 +110,34 @@ impl Experiment {
 #[pymethods]
 impl Experiment {
     #[new]
-    fn new(
-        qubits: usize,
-        ops: Option<PyReadonlyArray3<Complex<f64>>>,
-        perms: Option<PyReadonlyArray2<usize>>,
-    ) -> Self {
+    fn new(qubits: usize, ops: PyReadonlyArray3<Complex<f64>>) -> Self {
         let ops = ops.unwrap().as_array().to_owned();
-        let perms = perms.map(|x| x.as_array().to_owned());
-
-        Self::new_raw(qubits, Some(ops), perms)
+        Self::new_raw(qubits, Some(ops))
     }
 
     fn sample(&self, rho: &DensityMatrix, samples: usize) -> PyResult<Samples> {
         self.sample_raw(rho, samples).map_err(PyValueError::new_err)
     }
-
-    #[staticmethod]
-    fn make_perm_mat(py: Python<'_>, perm: Vec<usize>) -> PyResult<&PyAny> {
-        let permmat = make_perm::<f64>(&perm);
-        scipy_mat(py, &permmat).map_err(PyValueError::new_err)
-    }
 }
 
 // Performs best when u and s are csr
-fn measure_channel_pure(
+fn measure_channel_pure_dense<'a, It>(
     qubits: usize,
-    ops: &[ArrayView2<Complex<f64>>],
-    perm: &[usize],
-    rho: &CsVec<Complex<f64>>,
-    mut random_float: f64,
-) -> usize {
-    let u = kron_helper(ops.iter().map(|op| make_sprs(*op)));
-    let s = make_perm::<Complex<f64>>(&perm);
-    debug_assert!(random_float >= 0.0);
-    debug_assert!(random_float <= 1.0);
-
-    let sp = s.mul(rho);
-    let usp = u.mul(&sp);
-    for i in 0..1 << qubits {
-        // let b = make_sprs_onehot(i, 1 << qubits);
-        // let bus = b.mul(&u).mul(&s);
-        // let busp = bus.dot(rho);
-
-        let b = make_sprs_onehot(i, 1 << qubits);
-        let busp = b.dot(&usp);
-
-        let p = busp.norm_sqr();
-
-        random_float -= p;
-        if random_float <= 0.0 {
-            return i;
-        }
-    }
-    (1 << qubits) - 1
-}
-
-// Performs best when u and s are csr
-fn measure_channel_pure_dense(
-    qubits: usize,
-    ops: &[ArrayView2<Complex<f64>>],
-    perm: &[usize],
+    ops: It,
     rho: ArrayView1<Complex<f64>>,
     mut random_float: f64,
-) -> usize {
+) -> usize
+where
+    It: IntoIterator<Item = ((usize, usize), ArrayView2<'a, Complex<f64>>)>,
+{
     // let u = kron_helper(ops.iter().map(|op| make_sprs(*op)));
     let ops = ops
-        .iter()
-        .enumerate()
-        .map(|(i, op)| {
-            MatrixOp::new_matrix([2 * i, 2 * i + 1], op.iter().copied().collect::<Vec<_>>())
-        })
+        .into_iter()
+        .map(|((i, j), op)| MatrixOp::new_matrix([i, j], op.iter().copied().collect::<Vec<_>>()))
         .collect::<Vec<_>>();
-    let s = make_perm::<Complex<f64>>(&perm);
     debug_assert!(random_float >= 0.0);
     debug_assert!(random_float <= 1.0);
-    let mut t_sp = s.mul(&rho);
+    let mut t_sp = rho.to_owned();
     let mut t_usp = Array1::zeros((t_sp.len(),));
 
     // b is the "input" to the ops, a is the arena.
@@ -280,60 +187,6 @@ fn apply_ops<'a, OPS>(
         a.iter_mut().for_each(|x| *x = Complex::zero());
         // b is last thing written to, "input" for next stage.
     }
-}
-
-// Performs best when u, s, rho are csr
-fn measure_channel(
-    qubits: usize,
-    ops: &[ArrayView2<Complex<f64>>],
-    perm: &[usize],
-    rho: &CsMat<Complex<f64>>,
-    mut random_float: f64,
-) -> usize {
-    let u = kron_helper(ops.iter().map(|op| make_sprs(*op)));
-    let s = make_perm::<Complex<f64>>(&perm);
-    debug_assert!(random_float >= 0.0);
-    debug_assert!(random_float <= 1.0);
-    for i in 0..1 << qubits {
-        let b = make_sprs_onehot(i, 1 << qubits);
-        let bus = b.mul(&u).mul(&s);
-        let mut bust = bus.clone();
-        bust.iter_mut().for_each(|(_, c)| *c = c.conj());
-        let buspsub = bus.mul(rho).dot(&bust);
-        debug_assert!(buspsub.im < 1e-10);
-        random_float -= buspsub.re;
-        if random_float <= 0.0 {
-            return i;
-        }
-    }
-    (1 << qubits) - 1
-}
-
-fn measure_channel_dumb(
-    ops: &[ArrayView2<Complex<f64>>],
-    perm: &[usize],
-    rho: &CsMat<Complex<f64>>,
-    mut random_float: f64,
-) -> usize {
-    let u = kron_helper(ops.iter().map(|op| make_sprs(*op)));
-    let s = make_perm::<Complex<f64>>(&perm);
-    debug_assert!(random_float >= 0.0);
-    debug_assert!(random_float <= 1.0);
-    let mut udag = u.clone().transpose_into();
-    udag.data_mut().iter_mut().for_each(|x| *x = x.conj());
-
-    let usosu = u.mul(&s).mul(rho).mul(&s.transpose_view()).mul(&udag);
-    let diag = usosu.diag().to_dense();
-    let mut i = 0;
-    while i < diag.len() {
-        debug_assert!(diag[i].im.abs() < f64::EPSILON);
-        random_float -= diag[i].re;
-        if random_float < 0.0 {
-            return i;
-        }
-        i += 1;
-    }
-    diag.len() - 1
 }
 
 pub enum DensityType {
@@ -642,33 +495,44 @@ impl Samples {
 #[pyclass]
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Sample {
-    pub gates: Vec<usize>,
-    pub perm: Vec<usize>,
-    pub measurement: usize,
+    pub gates: Vec<((usize, usize), usize)>,
+    pub measurement: BitString,
 }
 
 #[pymethods]
 impl Sample {
     #[new]
-    fn new(gates: Vec<usize>, perm: Vec<usize>, measurement: usize) -> Self {
-        Self {
-            gates,
-            perm,
-            measurement,
-        }
+    fn new(gates: Vec<((usize, usize), usize)>, measurement: BitString) -> Self {
+        Self { gates, measurement }
     }
 
-    fn get_gates(&self) -> Vec<usize> {
+    fn get_gates(&self) -> Vec<((usize, usize), usize)> {
         self.gates.clone()
     }
 
-    fn get_perm(&self) -> Vec<usize> {
-        self.perm.clone()
+    fn get_measurement(&self) -> BitString {
+        self.measurement.clone()
     }
+}
 
-    fn get_measurement(&self) -> usize {
-        self.measurement
+#[pyclass]
+#[derive(Clone, Serialize, Deserialize)]
+struct BitString {
+    data: BitStringEnum,
+}
+
+impl Into<BitString> for usize {
+    fn into(self) -> BitString {
+        Self {
+            data: BitStringEnum::Small(self),
+        }
     }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+enum BitStringEnum {
+    Small(usize),
+    Large(Vec<usize>),
 }
 
 #[cfg(test)]
