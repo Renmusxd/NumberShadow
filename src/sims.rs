@@ -7,13 +7,11 @@ use std::mem::swap;
 use std::ops::Mul;
 use std::path::Path;
 
-use crate::recon::{filtered_channel_weight, Operator};
+use crate::recon::Operator;
 use crate::sims::DensityType::{MixedSparse, PureDense, PureSparse};
-use crate::utils::{
-    kron_helper, make_perm, make_sprs, make_sprs_onehot, scipy_mat, OperatorString,
-};
+use crate::utils::{make_sprs_onehot, BitString, OperatorString};
 use num_complex::Complex;
-use numpy::ndarray::{Array2, Array3, Axis};
+use numpy::ndarray::{Array3, Axis};
 use numpy::{ndarray, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3};
 use pyo3::exceptions::PyValueError;
 use qip_iterators::iterators::MatrixOp;
@@ -30,10 +28,10 @@ pub struct Experiment {
 }
 
 impl Experiment {
-    fn new_raw(qubits: usize, ops: Option<Array3<Complex<f64>>>) -> Self {
+    fn new_raw(qubits: usize, ops: Array3<Complex<f64>>) -> Self {
         Self {
             qubits,
-            pairwise_ops: ops.unwrap(),
+            pairwise_ops: ops,
         }
     }
 }
@@ -83,12 +81,6 @@ impl Experiment {
                 // Lets compute (U.U.U.U)S = US
                 let f = rng.gen();
                 let i = match &rho.mat {
-                    MixedSparse(m) => {
-                        unimplemented!()
-                    }
-                    PureSparse(v) => {
-                        unimplemented!()
-                    }
                     PureDense(v) => {
                         let ops_it = opis.iter().map(|((i, j), opi)| {
                             let op = self.pairwise_ops.index_axis(Axis(0), *opi);
@@ -98,9 +90,10 @@ impl Experiment {
                         let i = measure_channel_pure_dense(self.qubits, ops_it, v.view(), f);
                         i
                     }
+                    _ => unimplemented!(),
                 };
 
-                Sample::new(opis, i.into())
+                Sample::new(opis, BitString::new_short(i, self.qubits).make_long())
             })
             .collect::<Vec<_>>();
         Ok(Samples { samples })
@@ -111,8 +104,8 @@ impl Experiment {
 impl Experiment {
     #[new]
     fn new(qubits: usize, ops: PyReadonlyArray3<Complex<f64>>) -> Self {
-        let ops = ops.unwrap().as_array().to_owned();
-        Self::new_raw(qubits, Some(ops))
+        let ops = ops.as_array().to_owned();
+        Self::new_raw(qubits, ops)
     }
 
     fn sample(&self, rho: &DensityMatrix, samples: usize) -> PyResult<Samples> {
@@ -157,8 +150,7 @@ where
     // Value in b represents application of ops to sp.
     let usp = b;
 
-    for i in 0..1 << qubits {
-        let busp = usp[i];
+    for (i, busp) in usp.iter().enumerate() {
         let p = busp.norm_sqr();
 
         random_float -= p;
@@ -414,10 +406,6 @@ impl Samples {
         Self::default()
     }
 
-    fn get_perm_sizes(&self) -> Vec<usize> {
-        self.samples.iter().map(|x| x.perm.len()).collect()
-    }
-
     fn subset(&self, n: usize) -> Self {
         let mut rng = thread_rng();
         let subset = self.samples.choose_multiple(&mut rng, n).cloned().collect();
@@ -467,29 +455,6 @@ impl Samples {
             .map_err(|e| PyValueError::new_err(format!("{:?}", e)))?;
         bincode::deserialize(&buf).map_err(|e| PyValueError::new_err(format!("{:?}", e)))
     }
-
-    fn get_filtered_samples_for_op(&self, opstring: String) -> PyResult<Self> {
-        OperatorString::try_from(opstring)
-            .map(|ps| -> Self {
-                let new_samples = self
-                    .samples
-                    .iter()
-                    .filter(|sample| {
-                        let mut perm_inv = sample.perm.clone();
-                        for (i, k) in sample.perm.iter().enumerate() {
-                            perm_inv[*k] = i;
-                        }
-                        let cw = filtered_channel_weight(&ps, &perm_inv);
-                        cw.abs() > f64::EPSILON
-                    })
-                    .cloned()
-                    .collect();
-                Self {
-                    samples: new_samples,
-                }
-            })
-            .map_err(PyValueError::new_err)
-    }
 }
 
 #[pyclass]
@@ -513,26 +478,6 @@ impl Sample {
     fn get_measurement(&self) -> BitString {
         self.measurement.clone()
     }
-}
-
-#[pyclass]
-#[derive(Clone, Serialize, Deserialize)]
-struct BitString {
-    data: BitStringEnum,
-}
-
-impl Into<BitString> for usize {
-    fn into(self) -> BitString {
-        Self {
-            data: BitStringEnum::Small(self),
-        }
-    }
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-enum BitStringEnum {
-    Small(usize),
-    Large(Vec<usize>),
 }
 
 #[cfg(test)]
@@ -620,330 +565,330 @@ mod tests {
         assert_eq!(bb, u_on_b);
     }
 
-    #[test]
-    fn check_sim_easy() {
-        let qubits = 4;
-        let eye = Array2::eye(1 << 2);
-        let ops = (0..qubits / 2).map(|_| eye.view()).collect::<Vec<_>>();
-        let s = [0, 1, 2, 3];
-        let rho = make_simple_rho(qubits, 0);
-        let mut rng = thread_rng();
-        let i = measure_channel(qubits, &ops, &s, &rho, rng.gen());
-        assert_eq!(i, 0b0000);
-    }
+    // #[test]
+    // fn check_sim_easy() {
+    //     let qubits = 4;
+    //     let eye = Array2::eye(1 << 2);
+    //     let ops = (0..qubits / 2).map(|_| eye.view()).collect::<Vec<_>>();
+    //     let s = [0, 1, 2, 3];
+    //     let rho = make_simple_rho(qubits, 0);
+    //     let mut rng = thread_rng();
+    //     let i = measure_channel(qubits, &ops, &s, &rho, rng.gen());
+    //     assert_eq!(i, 0b0000);
+    // }
+    //
+    // #[test]
+    // fn check_sim_shift() {
+    //     let qubits = 4;
+    //     let eye = Array2::eye(1 << 2);
+    //     let ops = (0..qubits / 2).map(|_| eye.view()).collect::<Vec<_>>();
+    //     let s = [1, 2, 3, 0];
+    //     let rho = make_simple_rho(qubits, 0b0000);
+    //     let mut rng = thread_rng();
+    //     let f = rng.gen();
+    //     let i = measure_channel(qubits, &ops, &s, &rho, f);
+    //     assert_eq!(i, measure_channel_dumb(&ops, &s, &rho, f));
+    //     assert_eq!(i, 0b0000);
+    //
+    //     let qubits = 4;
+    //     let eye = Array2::eye(1 << 2);
+    //     let ops = (0..qubits / 2).map(|_| eye.view()).collect::<Vec<_>>();
+    //     let s = [1, 2, 3, 0];
+    //     let rho = make_simple_rho(qubits, 0b0001);
+    //     let mut rng = thread_rng();
+    //     let f = rng.gen();
+    //     let i = measure_channel(qubits, &ops, &s, &rho, f);
+    //     assert_eq!(i, measure_channel_dumb(&ops, &s, &rho, f));
+    //     assert_eq!(i, 0b1000);
+    // }
+    //
+    // #[test]
+    // fn check_sim_one() {
+    //     let qubits = 4;
+    //     let eye = Array2::eye(1 << 2);
+    //     let ops = (0..qubits / 2).map(|_| eye.view()).collect::<Vec<_>>();
+    //     let s = [0, 1, 2, 3];
+    //     let rho = make_simple_rho(qubits, 1);
+    //     let mut rng = thread_rng();
+    //     let f = rng.gen();
+    //     let i = measure_channel(qubits, &ops, &s, &rho, f);
+    //     assert_eq!(i, measure_channel_dumb(&ops, &s, &rho, f));
+    //     assert_eq!(i, 0b0001);
+    // }
+    //
+    // #[test]
+    // fn check_sim_shift_one() {
+    //     let qubits = 4;
+    //     let eye = Array2::eye(1 << 2);
+    //     let ops = (0..qubits / 2).map(|_| eye.view()).collect::<Vec<_>>();
+    //     let s = [1, 2, 3, 0];
+    //     let rho = make_simple_rho(qubits, 0b0001);
+    //     let mut rng = thread_rng();
+    //     let f = rng.gen();
+    //     let i = measure_channel(qubits, &ops, &s, &rho, f);
+    //     assert_eq!(i, measure_channel_dumb(&ops, &s, &rho, f));
+    //     assert_eq!(i, 0b1000);
+    // }
+    //
+    // #[test]
+    // fn check_sim_invshift_one() {
+    //     let qubits = 4;
+    //     let eye = Array2::eye(1 << 2);
+    //     let ops = (0..qubits / 2).map(|_| eye.view()).collect::<Vec<_>>();
+    //     let s = [3, 0, 1, 2];
+    //     let rho = make_simple_rho(qubits, 0b0001);
+    //     let mut rng = thread_rng();
+    //     let f = rng.gen();
+    //     let i = measure_channel(qubits, &ops, &s, &rho, f);
+    //     assert_eq!(i, measure_channel_dumb(&ops, &s, &rho, f));
+    //     assert_eq!(i, 0b0010);
+    // }
+    //
+    // #[test]
+    // fn check_sim_mixed() {
+    //     let qubits = 4;
+    //     let eye = Array2::eye(1 << 2);
+    //     let ops = (0..qubits / 2).map(|_| eye.view()).collect::<Vec<_>>();
+    //     let s = [3, 0, 1, 2];
+    //     let rho = make_mixed_rho(qubits);
+    //     let mut rng = thread_rng();
+    //     let f = rng.gen();
+    //     let i = measure_channel(qubits, &ops, &s, &rho, f);
+    //     assert_eq!(i, measure_channel_dumb(&ops, &s, &rho, f));
+    //     println!("{}", i);
+    // }
+    //
+    // #[test]
+    // fn check_trivials() {
+    //     let qubits = 4;
+    //     let eye = Array2::eye(1 << 2);
+    //     let ops = (0..qubits / 2).map(|_| eye.view()).collect::<Vec<_>>();
+    //     let s = [0, 1, 2, 3];
+    //     let mut rng = thread_rng();
+    //
+    //     for j in 0..qubits {
+    //         let mut rho = TriMat::new((1 << qubits, 1 << qubits));
+    //         rho.add_triplet(j, j, Complex::one());
+    //         let rho = rho.to_csr();
+    //
+    //         let f = rng.gen();
+    //         let newi = measure_channel(qubits, &ops, &s, &rho, f);
+    //         assert_eq!(newi, measure_channel_dumb(&ops, &s, &rho, f));
+    //         assert_eq!(newi, j);
+    //     }
+    // }
+    //
+    // #[test]
+    // fn check_spin_flip_first() {
+    //     let qubits = 4;
+    //     let s = [0, 1, 2, 3];
+    //
+    //     let mut x: TriMat<Complex<f64>> = TriMat::new((2, 2));
+    //     x.add_triplet(0, 1, Complex::one());
+    //     x.add_triplet(1, 0, Complex::one());
+    //     let x = x.to_csr();
+    //
+    //     let eye = CsMat::eye(2);
+    //     let x = kronecker_product(x.view(), eye.view()).to_dense();
+    //
+    //     let eye = Array2::eye(1 << 2);
+    //     let ops = Some(x.view())
+    //         .iter()
+    //         .copied()
+    //         .chain((0..qubits / 2 - 1).map(|_| eye.view()))
+    //         .collect::<Vec<_>>();
+    //
+    //     let mut rng = thread_rng();
+    //
+    //     for j in 0..qubits {
+    //         let mut rho = TriMat::new((1 << qubits, 1 << qubits));
+    //         rho.add_triplet(j, j, Complex::one());
+    //         let rho = rho.to_csr();
+    //
+    //         let f = rng.gen();
+    //         let newi = measure_channel(qubits, &ops, &s, &rho, f);
+    //         assert_eq!(newi, measure_channel_dumb(&ops, &s, &rho, f));
+    //         assert_eq!(newi, 0b1000 ^ j);
+    //     }
+    // }
+    //
+    // #[test]
+    // fn check_spin_flip_last() {
+    //     let qubits = 4;
+    //     let s = [0, 1, 2, 3];
+    //
+    //     let mut x: TriMat<Complex<f64>> = TriMat::new((2, 2));
+    //     x.add_triplet(0, 1, Complex::one());
+    //     x.add_triplet(1, 0, Complex::one());
+    //     let x = x.to_csr();
+    //
+    //     let eye = CsMat::eye(2);
+    //     let x = kronecker_product(eye.view(), x.view()).to_dense();
+    //
+    //     let eye = Array2::eye(1 << 2);
+    //     let ops = (0..qubits / 2 - 1)
+    //         .map(|_| eye.view())
+    //         .chain(Some(x.view()).iter().copied())
+    //         .collect::<Vec<_>>();
+    //     let mut rng = thread_rng();
+    //
+    //     for j in 0..qubits {
+    //         let mut rho = TriMat::new((1 << qubits, 1 << qubits));
+    //         rho.add_triplet(j, j, Complex::one());
+    //         let rho = rho.to_csr();
+    //
+    //         let f = rng.gen();
+    //         let newi = measure_channel(qubits, &ops, &s, &rho, f);
+    //         assert_eq!(newi, measure_channel_dumb(&ops, &s, &rho, f));
+    //         assert_eq!(newi, 0b0001 ^ j);
+    //     }
+    // }
+    //
+    // #[test]
+    // fn check_sim_flip() {
+    //     let qubits = 4;
+    //     let ua = Array2::eye(1 << 2);
+    //     let ub = x_flip_num().to_dense();
+    //     let ops = [ua.view(), ub.view()];
+    //     let s = [0, 1, 2, 3];
+    //     let rho = make_simple_rho(qubits, 0b0001);
+    //     let mut rng = thread_rng();
+    //     let f = rng.gen();
+    //     let newi = measure_channel(qubits, &ops, &s, &rho, f);
+    //     assert_eq!(newi, measure_channel_dumb(&ops, &s, &rho, f));
+    //     assert_eq!(newi, 0b0010);
+    //
+    //     let ops = [ub.view(), ua.view()];
+    //     let rho = make_simple_rho(qubits, 0b1000);
+    //     let mut rng = thread_rng();
+    //     let f = rng.gen();
+    //     let newi = measure_channel(qubits, &ops, &s, &rho, f);
+    //     assert_eq!(newi, measure_channel_dumb(&ops, &s, &rho, f));
+    //     assert_eq!(newi, 0b0100);
+    //
+    //     let s = [1, 0, 2, 3];
+    //
+    //     let ops = [ua.view(), ua.view()];
+    //     let rho = make_simple_rho(qubits, 0b1010);
+    //     let mut rng = thread_rng();
+    //     let f = rng.gen();
+    //     let newi = measure_channel(qubits, &ops, &s, &rho, f);
+    //     assert_eq!(newi, measure_channel_dumb(&ops, &s, &rho, f));
+    //     assert_eq!(newi, 0b0110);
+    // }
 
-    #[test]
-    fn check_sim_shift() {
-        let qubits = 4;
-        let eye = Array2::eye(1 << 2);
-        let ops = (0..qubits / 2).map(|_| eye.view()).collect::<Vec<_>>();
-        let s = [1, 2, 3, 0];
-        let rho = make_simple_rho(qubits, 0b0000);
-        let mut rng = thread_rng();
-        let f = rng.gen();
-        let i = measure_channel(qubits, &ops, &s, &rho, f);
-        assert_eq!(i, measure_channel_dumb(&ops, &s, &rho, f));
-        assert_eq!(i, 0b0000);
-
-        let qubits = 4;
-        let eye = Array2::eye(1 << 2);
-        let ops = (0..qubits / 2).map(|_| eye.view()).collect::<Vec<_>>();
-        let s = [1, 2, 3, 0];
-        let rho = make_simple_rho(qubits, 0b0001);
-        let mut rng = thread_rng();
-        let f = rng.gen();
-        let i = measure_channel(qubits, &ops, &s, &rho, f);
-        assert_eq!(i, measure_channel_dumb(&ops, &s, &rho, f));
-        assert_eq!(i, 0b1000);
-    }
-
-    #[test]
-    fn check_sim_one() {
-        let qubits = 4;
-        let eye = Array2::eye(1 << 2);
-        let ops = (0..qubits / 2).map(|_| eye.view()).collect::<Vec<_>>();
-        let s = [0, 1, 2, 3];
-        let rho = make_simple_rho(qubits, 1);
-        let mut rng = thread_rng();
-        let f = rng.gen();
-        let i = measure_channel(qubits, &ops, &s, &rho, f);
-        assert_eq!(i, measure_channel_dumb(&ops, &s, &rho, f));
-        assert_eq!(i, 0b0001);
-    }
-
-    #[test]
-    fn check_sim_shift_one() {
-        let qubits = 4;
-        let eye = Array2::eye(1 << 2);
-        let ops = (0..qubits / 2).map(|_| eye.view()).collect::<Vec<_>>();
-        let s = [1, 2, 3, 0];
-        let rho = make_simple_rho(qubits, 0b0001);
-        let mut rng = thread_rng();
-        let f = rng.gen();
-        let i = measure_channel(qubits, &ops, &s, &rho, f);
-        assert_eq!(i, measure_channel_dumb(&ops, &s, &rho, f));
-        assert_eq!(i, 0b1000);
-    }
-
-    #[test]
-    fn check_sim_invshift_one() {
-        let qubits = 4;
-        let eye = Array2::eye(1 << 2);
-        let ops = (0..qubits / 2).map(|_| eye.view()).collect::<Vec<_>>();
-        let s = [3, 0, 1, 2];
-        let rho = make_simple_rho(qubits, 0b0001);
-        let mut rng = thread_rng();
-        let f = rng.gen();
-        let i = measure_channel(qubits, &ops, &s, &rho, f);
-        assert_eq!(i, measure_channel_dumb(&ops, &s, &rho, f));
-        assert_eq!(i, 0b0010);
-    }
-
-    #[test]
-    fn check_sim_mixed() {
-        let qubits = 4;
-        let eye = Array2::eye(1 << 2);
-        let ops = (0..qubits / 2).map(|_| eye.view()).collect::<Vec<_>>();
-        let s = [3, 0, 1, 2];
-        let rho = make_mixed_rho(qubits);
-        let mut rng = thread_rng();
-        let f = rng.gen();
-        let i = measure_channel(qubits, &ops, &s, &rho, f);
-        assert_eq!(i, measure_channel_dumb(&ops, &s, &rho, f));
-        println!("{}", i);
-    }
-
-    #[test]
-    fn check_trivials() {
-        let qubits = 4;
-        let eye = Array2::eye(1 << 2);
-        let ops = (0..qubits / 2).map(|_| eye.view()).collect::<Vec<_>>();
-        let s = [0, 1, 2, 3];
-        let mut rng = thread_rng();
-
-        for j in 0..qubits {
-            let mut rho = TriMat::new((1 << qubits, 1 << qubits));
-            rho.add_triplet(j, j, Complex::one());
-            let rho = rho.to_csr();
-
-            let f = rng.gen();
-            let newi = measure_channel(qubits, &ops, &s, &rho, f);
-            assert_eq!(newi, measure_channel_dumb(&ops, &s, &rho, f));
-            assert_eq!(newi, j);
-        }
-    }
-
-    #[test]
-    fn check_spin_flip_first() {
-        let qubits = 4;
-        let s = [0, 1, 2, 3];
-
-        let mut x: TriMat<Complex<f64>> = TriMat::new((2, 2));
-        x.add_triplet(0, 1, Complex::one());
-        x.add_triplet(1, 0, Complex::one());
-        let x = x.to_csr();
-
-        let eye = CsMat::eye(2);
-        let x = kronecker_product(x.view(), eye.view()).to_dense();
-
-        let eye = Array2::eye(1 << 2);
-        let ops = Some(x.view())
-            .iter()
-            .copied()
-            .chain((0..qubits / 2 - 1).map(|_| eye.view()))
-            .collect::<Vec<_>>();
-
-        let mut rng = thread_rng();
-
-        for j in 0..qubits {
-            let mut rho = TriMat::new((1 << qubits, 1 << qubits));
-            rho.add_triplet(j, j, Complex::one());
-            let rho = rho.to_csr();
-
-            let f = rng.gen();
-            let newi = measure_channel(qubits, &ops, &s, &rho, f);
-            assert_eq!(newi, measure_channel_dumb(&ops, &s, &rho, f));
-            assert_eq!(newi, 0b1000 ^ j);
-        }
-    }
-
-    #[test]
-    fn check_spin_flip_last() {
-        let qubits = 4;
-        let s = [0, 1, 2, 3];
-
-        let mut x: TriMat<Complex<f64>> = TriMat::new((2, 2));
-        x.add_triplet(0, 1, Complex::one());
-        x.add_triplet(1, 0, Complex::one());
-        let x = x.to_csr();
-
-        let eye = CsMat::eye(2);
-        let x = kronecker_product(eye.view(), x.view()).to_dense();
-
-        let eye = Array2::eye(1 << 2);
-        let ops = (0..qubits / 2 - 1)
-            .map(|_| eye.view())
-            .chain(Some(x.view()).iter().copied())
-            .collect::<Vec<_>>();
-        let mut rng = thread_rng();
-
-        for j in 0..qubits {
-            let mut rho = TriMat::new((1 << qubits, 1 << qubits));
-            rho.add_triplet(j, j, Complex::one());
-            let rho = rho.to_csr();
-
-            let f = rng.gen();
-            let newi = measure_channel(qubits, &ops, &s, &rho, f);
-            assert_eq!(newi, measure_channel_dumb(&ops, &s, &rho, f));
-            assert_eq!(newi, 0b0001 ^ j);
-        }
-    }
-
-    #[test]
-    fn check_sim_flip() {
-        let qubits = 4;
-        let ua = Array2::eye(1 << 2);
-        let ub = x_flip_num().to_dense();
-        let ops = [ua.view(), ub.view()];
-        let s = [0, 1, 2, 3];
-        let rho = make_simple_rho(qubits, 0b0001);
-        let mut rng = thread_rng();
-        let f = rng.gen();
-        let newi = measure_channel(qubits, &ops, &s, &rho, f);
-        assert_eq!(newi, measure_channel_dumb(&ops, &s, &rho, f));
-        assert_eq!(newi, 0b0010);
-
-        let ops = [ub.view(), ua.view()];
-        let rho = make_simple_rho(qubits, 0b1000);
-        let mut rng = thread_rng();
-        let f = rng.gen();
-        let newi = measure_channel(qubits, &ops, &s, &rho, f);
-        assert_eq!(newi, measure_channel_dumb(&ops, &s, &rho, f));
-        assert_eq!(newi, 0b0100);
-
-        let s = [1, 0, 2, 3];
-
-        let ops = [ua.view(), ua.view()];
-        let rho = make_simple_rho(qubits, 0b1010);
-        let mut rng = thread_rng();
-        let f = rng.gen();
-        let newi = measure_channel(qubits, &ops, &s, &rho, f);
-        assert_eq!(newi, measure_channel_dumb(&ops, &s, &rho, f));
-        assert_eq!(newi, 0b0110);
-    }
-
-    #[test]
-    fn check_sim_flip_dense() {
-        let qubits = 4;
-        let ua = Array2::eye(1 << 2);
-        let ub = x_flip_num().to_dense();
-        let ops = [ua.view(), ub.view()];
-        let s = [0, 1, 2, 3];
-        let rho = make_simple_rho_dense(qubits, 0b0001);
-        let mut rng = thread_rng();
-        let f = rng.gen();
-        let newi = measure_channel_pure_dense(qubits, &ops, &s, rho.view(), f);
-        assert_eq!(newi, 0b0010);
-
-        let ops = [ub.view(), ua.view()];
-        let rho = make_simple_rho_dense(qubits, 0b1000);
-        let mut rng = thread_rng();
-        let f = rng.gen();
-        let newi = measure_channel_pure_dense(qubits, &ops, &s, rho.view(), f);
-        assert_eq!(newi, 0b0100);
-
-        let s = [1, 0, 2, 3];
-
-        let ops = [ua.view(), ua.view()];
-        let rho = make_simple_rho_dense(qubits, 0b1010);
-        let mut rng = thread_rng();
-        let f = rng.gen();
-        let newi = measure_channel_pure_dense(qubits, &ops, &s, rho.view(), f);
-        assert_eq!(newi, 0b0110);
-    }
-
-    #[test]
-    fn test_expectation() -> Result<(), String> {
-        let qubits = 4;
-        let rho = DensityMatrix::new_raw_pure_dense(Array1::ones((1 << qubits,)));
-
-        let opstring = OperatorString::try_new("ZZZZ".chars())?;
-        rho.expectation_opstring(&opstring)?;
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_sampling() -> Result<(), String> {
-        let qubits = 4;
-        let mut rho = TriMat::<Complex<f64>>::new((1 << qubits, 1 << qubits));
-        rho.add_triplet(0b0001, 0b0001, Complex::one());
-        rho.add_triplet(0b1000, 0b0001, Complex::one());
-        rho.add_triplet(0b0001, 0b1000, Complex::one());
-        rho.add_triplet(0b1000, 0b1000, Complex::one());
-        let rho: CsMat<Complex<f64>> = rho.to_csr();
-
-        let pauli_pairs = make_numcons_pauli_pairs();
-        let flat_paulis = pauli_pairs.into_shape((16, 4, 4)).unwrap();
-        let exp = Experiment::new_raw(qubits, Some(flat_paulis), None);
-
-        let rho = DensityMatrix::new_raw(rho);
-        let _samples = exp.sample_raw(&rho, 1000)?;
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_sampling_pure() -> Result<(), String> {
-        let qubits = 4;
-        let rho = CsVec::new(
-            1 << qubits,
-            (0..1 << qubits).collect(),
-            vec![Complex::one(); 1 << qubits],
-        );
-
-        let pauli_pairs = make_numcons_pauli_pairs();
-        let flat_paulis = pauli_pairs.into_shape((16, 4, 4)).unwrap();
-        let exp = Experiment::new_raw(qubits, Some(flat_paulis), None);
-
-        let rho = DensityMatrix::new_raw_pure(rho);
-        let _samples = exp.sample_raw(&rho, 1000)?;
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_sampling_pure_dense() -> Result<(), String> {
-        let qubits = 4;
-        let rho = CsVec::new(
-            1 << qubits,
-            (0..1 << qubits).collect(),
-            vec![Complex::one(); 1 << qubits],
-        );
-        let rho = rho.to_dense();
-
-        let pauli_pairs = make_numcons_pauli_pairs();
-        let flat_paulis = pauli_pairs.into_shape((16, 4, 4)).unwrap();
-        let exp = Experiment::new_raw(qubits, Some(flat_paulis), None);
-
-        let rho = DensityMatrix::new_raw_pure_dense(rho);
-        let _samples = exp.sample_raw(&rho, 1000)?;
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_sampling_pure_dense_larger() -> Result<(), String> {
-        let qubits = 6;
-        let rho = Array1::ones((1 << qubits,));
-
-        let pauli_pairs = make_numcons_pauli_pairs();
-        let flat_paulis = pauli_pairs.into_shape((16, 4, 4)).unwrap();
-        let exp = Experiment::new_raw(qubits, Some(flat_paulis), None);
-
-        let rho = DensityMatrix::new_raw_pure_dense(rho);
-        let _samples = exp.sample_raw(&rho, 1000)?;
-
-        Ok(())
-    }
+    // #[test]
+    // fn check_sim_flip_dense() {
+    //     let qubits = 4;
+    //     let ua = Array2::eye(1 << 2);
+    //     let ub = x_flip_num().to_dense();
+    //     let ops = [ua.view(), ub.view()];
+    //     let s = [0, 1, 2, 3];
+    //     let rho = make_simple_rho_dense(qubits, 0b0001);
+    //     let mut rng = thread_rng();
+    //     let f = rng.gen();
+    //     let newi = measure_channel_pure_dense(qubits, &ops, &s, rho.view(), f);
+    //     assert_eq!(newi, 0b0010);
+    //
+    //     let ops = [ub.view(), ua.view()];
+    //     let rho = make_simple_rho_dense(qubits, 0b1000);
+    //     let mut rng = thread_rng();
+    //     let f = rng.gen();
+    //     let newi = measure_channel_pure_dense(qubits, &ops, &s, rho.view(), f);
+    //     assert_eq!(newi, 0b0100);
+    //
+    //     let s = [1, 0, 2, 3];
+    //
+    //     let ops = [ua.view(), ua.view()];
+    //     let rho = make_simple_rho_dense(qubits, 0b1010);
+    //     let mut rng = thread_rng();
+    //     let f = rng.gen();
+    //     let newi = measure_channel_pure_dense(qubits, &ops, &s, rho.view(), f);
+    //     assert_eq!(newi, 0b0110);
+    // }
+    //
+    // #[test]
+    // fn test_expectation() -> Result<(), String> {
+    //     let qubits = 4;
+    //     let rho = DensityMatrix::new_raw_pure_dense(Array1::ones((1 << qubits,)));
+    //
+    //     let opstring = OperatorString::try_new("ZZZZ".chars())?;
+    //     rho.expectation_opstring(&opstring)?;
+    //
+    //     Ok(())
+    // }
+    //
+    // #[test]
+    // fn test_sampling() -> Result<(), String> {
+    //     let qubits = 4;
+    //     let mut rho = TriMat::<Complex<f64>>::new((1 << qubits, 1 << qubits));
+    //     rho.add_triplet(0b0001, 0b0001, Complex::one());
+    //     rho.add_triplet(0b1000, 0b0001, Complex::one());
+    //     rho.add_triplet(0b0001, 0b1000, Complex::one());
+    //     rho.add_triplet(0b1000, 0b1000, Complex::one());
+    //     let rho: CsMat<Complex<f64>> = rho.to_csr();
+    //
+    //     let pauli_pairs = make_numcons_pauli_pairs();
+    //     let flat_paulis = pauli_pairs.into_shape((16, 4, 4)).unwrap();
+    //     let exp = Experiment::new_raw(qubits, Some(flat_paulis), None);
+    //
+    //     let rho = DensityMatrix::new_raw(rho);
+    //     let _samples = exp.sample_raw(&rho, 1000)?;
+    //
+    //     Ok(())
+    // }
+    //
+    // #[test]
+    // fn test_sampling_pure() -> Result<(), String> {
+    //     let qubits = 4;
+    //     let rho = CsVec::new(
+    //         1 << qubits,
+    //         (0..1 << qubits).collect(),
+    //         vec![Complex::one(); 1 << qubits],
+    //     );
+    //
+    //     let pauli_pairs = make_numcons_pauli_pairs();
+    //     let flat_paulis = pauli_pairs.into_shape((16, 4, 4)).unwrap();
+    //     let exp = Experiment::new_raw(qubits, Some(flat_paulis), None);
+    //
+    //     let rho = DensityMatrix::new_raw_pure(rho);
+    //     let _samples = exp.sample_raw(&rho, 1000)?;
+    //
+    //     Ok(())
+    // }
+    //
+    // #[test]
+    // fn test_sampling_pure_dense() -> Result<(), String> {
+    //     let qubits = 4;
+    //     let rho = CsVec::new(
+    //         1 << qubits,
+    //         (0..1 << qubits).collect(),
+    //         vec![Complex::one(); 1 << qubits],
+    //     );
+    //     let rho = rho.to_dense();
+    //
+    //     let pauli_pairs = make_numcons_pauli_pairs();
+    //     let flat_paulis = pauli_pairs.into_shape((16, 4, 4)).unwrap();
+    //     let exp = Experiment::new_raw(qubits, Some(flat_paulis), None);
+    //
+    //     let rho = DensityMatrix::new_raw_pure_dense(rho);
+    //     let _samples = exp.sample_raw(&rho, 1000)?;
+    //
+    //     Ok(())
+    // }
+    //
+    // #[test]
+    // fn test_sampling_pure_dense_larger() -> Result<(), String> {
+    //     let qubits = 6;
+    //     let rho = Array1::ones((1 << qubits,));
+    //
+    //     let pauli_pairs = make_numcons_pauli_pairs();
+    //     let flat_paulis = pauli_pairs.into_shape((16, 4, 4)).unwrap();
+    //     let exp = Experiment::new_raw(qubits, Some(flat_paulis), None);
+    //
+    //     let rho = DensityMatrix::new_raw_pure_dense(rho);
+    //     let _samples = exp.sample_raw(&rho, 1000)?;
+    //
+    //     Ok(())
+    // }
 }

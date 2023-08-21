@@ -1,10 +1,12 @@
 use crate::sims::{Sample, Samples};
-use crate::utils::{fact, fact2, make_numcons_pauli_pairs, reverse_n_bits, OpChar, OperatorString};
-use ndarray::Array4;
+use crate::utils::*;
+use ndarray::{s, Array4, ArrayView2, Axis};
+use num_bigint::BigInt;
 use num_complex::Complex;
+use num_rational::BigRational;
 use num_traits::{One, ToPrimitive, Zero};
-use numpy::ndarray::{s, Array1, Array2, Array3, ArrayView3, ArrayView4};
-use numpy::{IntoPyArray, PyArray1, PyReadonlyArray3, ToPyArray};
+use numpy::ndarray::{Array3, ArrayView3};
+use numpy::{IntoPyArray, PyArray1, ToPyArray};
 use pyo3::exceptions::PyValueError;
 use pyo3::types::PyComplex;
 use pyo3::{pyclass, pymethods, Py, PyResult, Python};
@@ -17,55 +19,7 @@ pub struct Reconstruction {
 }
 
 impl Reconstruction {
-    fn estimate_operator_string(
-        &self,
-        ps: &OperatorString,
-        samples: &Samples,
-    ) -> (Complex<f64>, usize) {
-        // For each operator substring, estimate it using the relevant permutations.
-        let enumerating_indices = (0..ps.opstring.len()).collect::<Vec<_>>();
-        let available_indices = ps.indices.as_ref();
-        let iter_indices = if let Some(indices) = available_indices {
-            indices
-        } else {
-            &enumerating_indices
-        };
-
-        let (noni_indices, noni_substring): (Vec<_>, Vec<_>) = iter_indices
-            .iter()
-            .zip(ps.opstring.iter())
-            .filter(|(_, op)| OpChar::I.ne(op))
-            .map(|(a, b)| (*a, *b))
-            .unzip();
-
-        let subop: OperatorString = noni_substring.into();
-        let cw = unfiltered_channel_weight(&subop);
-        if cw.abs() < f64::EPSILON {
-            (Complex::<f64>::zero(), 0)
-        } else {
-            let (tot, count) = samples
-                .samples
-                .par_iter()
-                .filter(|sample| filter_permutations(&sample.perm, &noni_indices))
-                .map(|sample| -> (Complex<f64>, usize) {
-                    let sub_acc = estimate_string_for_sample(
-                        ps,
-                        sample,
-                        self.pauli_pairs.view(),
-                        self.pairwise_ops.view(),
-                    );
-                    (sub_acc, 1)
-                })
-                .reduce(
-                    || (Complex::<f64>::zero(), 0),
-                    |(ac, ai), (bc, bi)| (ac + bc, ai + bi),
-                );
-
-            (tot / (cw * count as f64), count)
-        }
-    }
-
-    fn filter_estimate_operator_string_iterator<'a>(
+    fn estimate_operator_string_iterator<'a>(
         &'a self,
         opstring: &'a OperatorString,
         samples: &'a Samples,
@@ -74,24 +28,7 @@ impl Reconstruction {
         samples
             .samples
             .par_iter()
-            .filter_map(|sample: &Sample| -> Option<Complex<f64>> {
-                let mut perm_inv = sample.perm.clone();
-                for (i, k) in sample.perm.iter().enumerate() {
-                    perm_inv[*k] = i;
-                }
-                let channel_weight = filtered_channel_weight(opstring, &perm_inv);
-                if channel_weight.abs() < f64::EPSILON {
-                    None
-                } else {
-                    let sub_acc = estimate_string_for_sample(
-                        opstring,
-                        sample,
-                        self.pauli_pairs.view(),
-                        self.pairwise_ops.view(),
-                    );
-                    Some(sub_acc / channel_weight)
-                }
-            })
+            .map(|sample: &Sample| -> Complex<f64> { unimplemented!() })
     }
 }
 
@@ -107,128 +44,313 @@ impl Reconstruction {
     }
 }
 
-fn estimate_string_for_sample(
-    ps: &OperatorString,
+fn estimate_op_string(
+    opstring: &OperatorString,
     sample: &Sample,
-    pauli_pairs: ArrayView4<Complex<f64>>,
     pairwise_ops: ArrayView3<Complex<f64>>,
+    betas: &[f64],
 ) -> Complex<f64> {
-    let ordered_meas = reverse_n_bits(sample.measurement, sample.perm.len() as u32);
-
-    // Number of sites spanned by operator string.
-    let op_support = sample.perm.len();
-
-    let mut perm_inv = sample.perm.clone();
-    for (i, k) in sample.perm.iter().enumerate() {
-        perm_inv[*k] = i;
+    let l = sample.measurement.num_bits();
+    // Siphon off the +- pairs
+    let np = opstring
+        .opstring
+        .iter()
+        .copied()
+        .filter(|op| OpChar::Plus.eq(op))
+        .count();
+    let nm = opstring
+        .opstring
+        .iter()
+        .copied()
+        .filter(|op| OpChar::Minus.eq(op))
+        .count();
+    // If not number conserving.
+    if nm != np {
+        return Complex::zero();
     }
-
-    (0..op_support / 2)
-        .map(|pair_index| {
-            let site_a = perm_inv[2 * pair_index];
-            let site_b = perm_inv[2 * pair_index + 1];
-
-            let pauli_a = ps.get(site_a);
-            let pauli_b = ps.get(site_b);
-
-            if pauli_a == OpChar::I && pauli_b == OpChar::I {
-                Complex::<f64>::one()
-            } else {
-                // Get the 'local' measurement result.
-                let bit_a = (ordered_meas >> (2 * pair_index)) & 1;
-                let bit_b = (ordered_meas >> (2 * pair_index + 1)) & 1;
-
-                let submeas = (bit_a << 1) | bit_b;
-
-                // Create <b|
-                let mut b = Array2::zeros((1, 4));
-                b[(0, submeas)] = Complex::<f64>::one();
-
-                // Compute <b|U
-                let pairwise_opi = sample.gates[pair_index];
-                let u = pairwise_ops.slice(s![pairwise_opi, .., ..]);
-                let bu = b.dot(&u);
-                debug_assert_eq!(b.shape(), bu.shape());
-
-                // Compute <b|USp
-                let pauli_ai: usize = pauli_a.into();
-                let pauli_bi: usize = pauli_b.into();
-                let pauli_pair_mat = pauli_pairs.slice(s![pauli_ai, pauli_bi, .., ..]);
-                let buso = bu.dot(&pauli_pair_mat);
-                debug_assert_eq!(b.shape(), buso.shape());
-
-                // Compute <b|USpSU|b>
-                buso.into_iter()
-                    .zip(bu.into_iter())
-                    .map(|(a, b)| a * b.conj())
-                    .sum::<Complex<f64>>()
+    if np > 0 {
+        unimplemented!()
+    }
+    // Check joined.
+    let num_plus_joined_to_minus = sample
+        .gates
+        .iter()
+        .copied()
+        .filter(|((a, b), _)| {
+            let oa = opstring.opstring.get(*a).copied().unwrap_or(OpChar::I);
+            let ob = opstring.opstring.get(*b).copied().unwrap_or(OpChar::I);
+            match (oa, ob) {
+                (OpChar::Plus, OpChar::Minus) | (OpChar::Minus, OpChar::Plus) => true,
+                _ => false,
             }
         })
-        .product::<Complex<f64>>()
-}
+        .count();
+    debug_assert!(num_plus_joined_to_minus <= np);
 
-fn filter_permutations(perm: &[usize], noni_indices: &[usize]) -> bool {
-    let mut perm_inv = perm.to_vec();
-    for (i, k) in perm.iter().enumerate() {
-        perm_inv[*k] = i;
+    // If not all pluses are joined to minuses.
+    if num_plus_joined_to_minus != np {
+        return Complex::zero();
     }
 
-    (0..perm.len() / 2).all(|pair_index| {
-        let sia = perm_inv[2 * pair_index];
-        let sib = perm_inv[2 * pair_index + 1];
+    let nz = opstring
+        .opstring
+        .iter()
+        .copied()
+        .filter(|op| OpChar::Z.eq(op))
+        .count();
 
-        noni_indices.contains(&sia) == noni_indices.contains(&sib)
+    let mut ops_and_meas = (0..l).collect::<Vec<_>>();
+    ops_and_meas.sort_unstable_by_key(|i| {
+        let op = opstring.opstring.get(*i).copied().unwrap_or(OpChar::I);
+        match op {
+            OpChar::Plus => 0,
+            OpChar::Minus => 0,
+            OpChar::Z => 1,
+            OpChar::I => 2,
+        }
+    });
+    let pm_indices = &ops_and_meas[..np + nm];
+    let z_indices = &ops_and_meas[np + nm..np + nm + nz];
+    let remaining_indices = &ops_and_meas[np + nm + nz..];
+
+    debug_assert_eq!(l - (np + nm), z_indices.len() + remaining_indices.len());
+    let mut binstring = BitString::new_long(l - (np + nm));
+    let mut mapping = vec![usize::MAX; l];
+    z_indices
+        .iter()
+        .copied()
+        .chain(remaining_indices.iter().copied())
+        .enumerate()
+        .for_each(|(new_index, old_index)| {
+            binstring.set_bit(new_index, sample.measurement.get_bit(old_index));
+            mapping[old_index] = new_index;
+        });
+
+    let remap_gates = sample
+        .gates
+        .iter()
+        .copied()
+        .filter_map(|((a, b), ui)| {
+            let new_a = mapping[a];
+            let new_b = mapping[b];
+            match (new_a, new_b) {
+                (usize::MAX, usize::MAX) => None,
+                (usize::MAX, _) | (_, usize::MAX) => {
+                    unreachable!()
+                }
+                (a, b) => Some(((a, b), ui)),
+            }
+        })
+        .collect::<Vec<_>>();
+    let subsample = Sample {
+        gates: remap_gates,
+        measurement: binstring,
+    };
+    let z_estimate =
+        estimate_canonical_z_string(l - (np + nm), nz, &subsample, pairwise_ops, betas);
+
+    z_estimate
+}
+
+fn estimate_canonical_z_string(
+    l: usize,
+    k: usize,
+    sample: &Sample,
+    pairwise_ops: ArrayView3<Complex<f64>>,
+    betas: &[f64],
+) -> Complex<f64> {
+    // Indices 0...(k-1) have Z operators.
+    let connected_to_zs =
+        get_connected_to_zs(k, sample.gates.iter().map(|(x, _)| *x)).collect::<Vec<_>>();
+
+    // Get the counts of binary pairs away from the operator.
+    let it = sample
+        .gates
+        .iter()
+        .map(|(x, _)| *x)
+        .filter(|(a, b)| *a >= k && *b >= k);
+    let (n00, n01, n11) = count_pairs_for_us(it, &sample.measurement);
+    debug_assert_eq!(n00 + n01 + n11, l - (k + connected_to_zs.len()));
+    // Use the counts to compute all the delocalized inner products we may need.
+    let hs = (0..=k)
+        .map(|nz| {
+            delocalized_z_calculation(nz, n00, n01, n11)
+                .to_f64()
+                .expect("Error converting big rational to f64")
+        })
+        .collect::<Vec<_>>();
+
+    // Lets track backwards which Unitaries connect to site i
+    let mut lookup = vec![0; l];
+    let mut us_in_op_region = vec![];
+    sample
+        .gates
+        .iter()
+        .copied()
+        .enumerate()
+        .for_each(|(ui, ((a, b), _))| {
+            lookup[a] = ui;
+            lookup[b] = ui;
+            us_in_op_region.push(ui);
+        });
+
+    // Iterate over all swap-distances d
+    (0..=k)
+        .map(|d| {
+            // Iterate over internal vs external swaps.
+            betas[d]
+                * (0..=d)
+                    .map(|a| -> Complex<f64> {
+                        let b = d - a;
+                        // Within specified nearby-operator indices:
+                        // start with k Zs, remove b of them, swap a of them
+                        // (k-d) of the Zs are still in place.
+                        fold_over_choices(k, k - d, Complex::zero(), |acc, stay_in_place| {
+                            fold_over_choices(connected_to_zs.len(), a, acc, |acc, moved_to_rel| {
+                                debug_assert_eq!(stay_in_place.len() + moved_to_rel.len(), k - b);
+                                let mut zlookup = vec![false; l];
+                                stay_in_place
+                                    .iter()
+                                    .copied()
+                                    .chain(moved_to_rel.iter().copied().map(|i| connected_to_zs[i]))
+                                    .for_each(|x| zlookup[x] = true);
+
+                                let prod = us_in_op_region
+                                    .iter()
+                                    .map(|ui| sample.gates[*ui])
+                                    .map(|((i, j), iu)| {
+                                        let bi = sample.measurement.get_bit(i);
+                                        let bj = sample.measurement.get_bit(j);
+                                        let zi = zlookup[i];
+                                        let zj = zlookup[j];
+
+                                        compute_single_inner(
+                                            bi,
+                                            bj,
+                                            zi,
+                                            zj,
+                                            pairwise_ops.index_axis(Axis(0), iu),
+                                        )
+                                    })
+                                    .product::<Complex<f64>>();
+                                acc + prod
+                            })
+                        }) * hs[b]
+                    })
+                    .sum::<Complex<f64>>()
+        })
+        .sum::<Complex<f64>>()
+}
+
+fn count_pairs_for_us<It>(it: It, measurement: &BitString) -> (usize, usize, usize)
+where
+    It: IntoIterator<Item = (usize, usize)>,
+{
+    it.into_iter().fold(
+        (0usize, 0usize, 0usize),
+        |(mut n00, mut n01, mut n11), (a, b)| {
+            let bh = measurement.get_bit(a);
+            let bt = measurement.get_bit(b);
+            match (bh, bt) {
+                (false, false) => {
+                    n00 += 1;
+                }
+                (true, false) | (false, true) => {
+                    n01 += 1;
+                }
+                (true, true) => {
+                    n11 += 1;
+                }
+            }
+            (n00, n01, n11)
+        },
+    )
+}
+
+fn get_connected_to_zs<It>(k: usize, it: It) -> impl Iterator<Item = usize>
+where
+    It: IntoIterator<Item = (usize, usize)>,
+{
+    it.into_iter().filter_map(move |(a, b)| {
+        let head = a.min(b);
+        let tail = a.min(b);
+        if head < k && tail >= k {
+            Some(tail)
+        } else {
+            None
+        }
     })
 }
 
-pub fn filtered_channel_weight(opstring: &OperatorString, perm_inv: &[usize]) -> f64 {
-    (0..perm_inv.len() / 2)
-        .map(|pair_index| {
-            let site_a = perm_inv[2 * pair_index];
-            let site_b = perm_inv[2 * pair_index + 1];
-
-            let pauli_a = opstring.get(site_a);
-            let pauli_b = opstring.get(site_b);
-
-            match (pauli_a, pauli_b) {
-                (OpChar::Plus, OpChar::Minus) | (OpChar::Minus, OpChar::Plus) => 1. / 3.,
-                (OpChar::Plus, _) | (OpChar::Minus, _) | (_, OpChar::Plus) | (_, OpChar::Minus) => {
-                    0.0
-                }
-                (OpChar::Z, OpChar::Z) | (OpChar::I, OpChar::I) => 1.0,
-                // For now, ignore mixed ZI
-                (OpChar::Z, OpChar::I) | (OpChar::I, OpChar::Z) => 0.0,
+fn compute_single_inner(
+    bi: bool,
+    bj: bool,
+    zi: bool,
+    zj: bool,
+    u: ArrayView2<Complex<f64>>,
+) -> Complex<f64> {
+    // If bi==bj then we are in the full or empty sectors where U is trivial.
+    match (bi, bj) {
+        (false, false) => Complex::one(),
+        (true, true) => {
+            if zi == zj {
+                Complex::one()
+            } else {
+                -Complex::one()
             }
-        })
-        .product()
+        }
+        (bi, _) => {
+            // We want <b| U (Pi Pj) U^\dagger |b>
+            // First get <b| U
+            let bu = u.slice(s![1 + (bi as usize), 1..3]).to_owned();
+            // Then get U^\dagger |b>
+            let mut ub = bu.clone();
+            ub.iter_mut().for_each(|x| *x = x.conj());
+
+            if zi {
+                ub[1] *= -1.0;
+            }
+            if zj {
+                ub[0] *= -1.0;
+            }
+
+            bu.dot(&ub)
+        }
+    }
 }
 
-pub fn unfiltered_channel_weight(opstring: &OperatorString) -> f64 {
-    let [count_z, count_p, count_m, count_i] = opstring.count_terms();
-    let qubits = count_z + count_p + count_m + count_i;
-    if count_i != 0 {
-        unimplemented!()
-    }
+fn delocalized_z_calculation(nz: usize, n00: usize, n01: usize, n11: usize) -> BigRational {
+    (0..=nz / 2)
+        .map(|m| {
+            let first_sum = (0..=m)
+                .map(|a| -> BigRational {
+                    let b = m - a;
+                    let neg = if b % 2 == 0 {
+                        BigRational::one()
+                    } else {
+                        -BigRational::one()
+                    };
+                    neg * rational_choose(n00 + n11 - (nz - 2 * m), a) * rational_choose(n01, b)
+                })
+                .sum::<BigRational>();
+            let second_sum = (0..=(nz - 2 * m))
+                .map(|x| -> BigRational {
+                    let y = (nz - 2 * m) - x;
 
-    // Not number conserving
-    if count_p != count_m {
-        return 0.0;
-    }
-
-    // All Z
-    if count_p == 0 {
-        return 1.0;
-    }
-
-    let prefactor = (1. / 3.0f64).powi(count_p as i32);
-    let places_for_pluses = fact2(qubits) / fact2(qubits - 2 * count_p);
-    let places_for_minuses = fact(count_m);
-    let places_for_rest = fact(qubits - (count_m + count_p));
-    let total_arrangements = fact(qubits);
-
-    prefactor
-        * ((places_for_pluses * places_for_minuses * places_for_rest) as f64
-            / total_arrangements as f64)
+                    let neg = if y % 2 == 0 {
+                        BigRational::one()
+                    } else {
+                        -BigRational::one()
+                    };
+                    neg * BigInt::from(2).pow((nz - 2 * m) as u32)
+                        * rational_choose(n00, x)
+                        * rational_choose(n11, y)
+                })
+                .sum::<BigRational>();
+            println!("(m={})\t{:?}\t{:?}", m, first_sum, second_sum);
+            first_sum * second_sum
+        })
+        .sum::<BigRational>()
 }
 
 #[pyclass]
@@ -274,84 +396,115 @@ impl Operator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::Axis;
+    use ndarray::Array2;
 
-    #[test]
-    fn check_weight_simple() -> Result<(), String> {
-        let opstring = "ZZZZ".try_into()?;
-        let w = unfiltered_channel_weight(&opstring);
-
-        assert!((w - 1.0).abs() < 1e-10);
-        Ok(())
+    fn make_sample(l: usize, m: usize) -> Sample {
+        let bm = BitString::new_short(m, l);
+        let gates = (0..l / 2).map(|i| ((2 * i, 2 * i + 1), 0));
+        Sample {
+            gates: gates.collect(),
+            measurement: bm,
+        }
     }
 
     #[test]
-    fn check_weight_pmpmpm() -> Result<(), String> {
-        let opstring = "+-+-+-".try_into()?;
-        let w = unfiltered_channel_weight(&opstring);
-        assert!((w - 0.014814814814814815).abs() < 1e-10);
-        Ok(())
+    fn check_deloc_simple() {
+        let l = 8;
+        // Assume we have all 0s, deloc just counts strings.
+        for i in 0..l / 2 {
+            assert_eq!(
+                delocalized_z_calculation(i, l / 2, 0, 0),
+                rational_choose(l, i)
+            );
+        }
     }
 
     #[test]
-    fn test_recon() -> Result<(), String> {
-        let opstring = "ZZII".try_into()?;
-
-        let pairwise_ops = Array2::eye(1 << 2).insert_axis(Axis(0));
-        let pauli_pairs = make_numcons_pauli_pairs();
-
-        let sample = Sample {
-            gates: vec![0, 0],
-            perm: vec![0, 1, 2, 3],
-            measurement: 0b1000,
-        };
-
-        let measured =
-            estimate_string_for_sample(&opstring, &sample, pauli_pairs.view(), pairwise_ops.view());
-
-        println!("measured: {:?}", measured);
-
-        Ok(())
+    fn check_deloc_simple_ones() {
+        let l = 8;
+        // All 1s identical to all 0s but with a global (-1)^nz
+        for i in 0..l / 2 {
+            assert_eq!(
+                delocalized_z_calculation(i, l / 2, 0, 0),
+                delocalized_z_calculation(i, 0, 0, l / 2) * BigInt::from(-1).pow(i as u32),
+            );
+        }
     }
 
     #[test]
-    fn test_recon_allz() -> Result<(), String> {
-        let opstring = "ZZZZ".try_into()?;
+    fn test_count_pairs() {
+        let samples = make_sample(8, 0);
+        let counts =
+            count_pairs_for_us(samples.gates.iter().map(|(x, _)| *x), &samples.measurement);
+        assert_eq!(counts, (4, 0, 0));
 
-        let pairwise_ops = Array2::eye(1 << 2).insert_axis(Axis(0));
-        let pauli_pairs = make_numcons_pauli_pairs();
+        let samples = make_sample(8, 0b11111111);
+        let counts =
+            count_pairs_for_us(samples.gates.iter().map(|(x, _)| *x), &samples.measurement);
+        assert_eq!(counts, (0, 0, 4));
 
-        let sample = Sample {
-            gates: vec![0, 0],
-            perm: vec![0, 1, 2, 3],
-            measurement: 0b1000,
-        };
-
-        let measured =
-            estimate_string_for_sample(&opstring, &sample, pauli_pairs.view(), pairwise_ops.view());
-
-        assert!((measured.re + 1.0).abs() < f64::EPSILON);
-        assert!((measured.im).abs() < f64::EPSILON);
-
-        Ok(())
+        let samples = make_sample(8, 0b00011011);
+        let counts =
+            count_pairs_for_us(samples.gates.iter().map(|(x, _)| *x), &samples.measurement);
+        assert_eq!(counts, (1, 2, 1));
     }
 
     #[test]
-    fn test_recon_farpm() -> Result<(), String> {
-        let opstring = "+II-".try_into()?;
+    fn test_overlaps() {
+        let eye = Array2::eye(4);
+        [false, true].iter().copied().for_each(|bi| {
+            [false, true].iter().copied().for_each(|bj| {
+                [false, true].iter().copied().for_each(|zi| {
+                    [false, true].iter().copied().for_each(|zj| {
+                        let mut x = Complex::one();
+                        if bi && zi {
+                            x *= -1.0;
+                        }
+                        if bj && zj {
+                            x *= -1.0;
+                        }
+                        assert_eq!(
+                            x,
+                            compute_single_inner(bi, bj, zi, zj, eye.view()),
+                            "Failed to estimate for state |{},{}> with Zs: {},{}",
+                            bi,
+                            bj,
+                            zi,
+                            zj
+                        );
+                    })
+                });
+            })
+        });
 
-        let pairwise_ops = Array2::eye(1 << 2).insert_axis(Axis(0));
-        let pauli_pairs = make_numcons_pauli_pairs();
-
-        let sample = Sample {
-            gates: vec![0, 0],
-            perm: vec![1, 3, 2, 0],
-            measurement: 0b1000,
-        };
-
-        let measured =
-            estimate_string_for_sample(&opstring, &sample, pauli_pairs.view(), pairwise_ops.view());
-
-        Ok(())
+        let mut arr = Array2::zeros((4, 4));
+        arr[(0, 0)] = Complex::one();
+        arr[(1, 2)] = Complex::one();
+        arr[(2, 1)] = Complex::one();
+        arr[(3, 3)] = Complex::one();
+        [false, true].iter().copied().for_each(|bi| {
+            [false, true].iter().copied().for_each(|bj| {
+                [false, true].iter().copied().for_each(|zi| {
+                    [false, true].iter().copied().for_each(|zj| {
+                        let mut x = Complex::one();
+                        if bi && zj {
+                            x *= -1.0;
+                        }
+                        if bj && zi {
+                            x *= -1.0;
+                        }
+                        assert_eq!(
+                            x,
+                            compute_single_inner(bi, bj, zi, zj, arr.view()),
+                            "Failed to estimate for state |{},{}> with Zs: {},{}",
+                            bi,
+                            bj,
+                            zi,
+                            zj
+                        );
+                    })
+                });
+            })
+        });
     }
 }

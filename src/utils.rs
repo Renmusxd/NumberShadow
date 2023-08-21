@@ -1,11 +1,14 @@
 use ndarray::Array1;
+use num_bigint::BigInt;
 use num_complex::Complex;
+use num_rational::{BigRational, Ratio};
 use num_traits::{One, Zero};
 use numpy::ndarray;
 use numpy::ndarray::{Array2, Array4, ArrayView2, Axis};
 use pyo3::prelude::*;
 use pyo3::types::IntoPyDict;
 use pyo3::Python;
+use serde::{Deserialize, Serialize};
 use sprs::{kronecker_product, CsMat, CsVec, TriMat};
 use std::ops::Add;
 
@@ -336,9 +339,177 @@ where
         })
 }
 
+#[pyclass]
+#[derive(Clone, Serialize, Deserialize)]
+pub struct BitString {
+    size: usize,
+    data: BitStringEnum,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub enum BitStringEnum {
+    Small(usize),
+    Large(Vec<bool>),
+}
+
+impl BitString {
+    pub fn new_long(num_bits: usize) -> Self {
+        Self {
+            size: num_bits,
+            data: BitStringEnum::Large(vec![false; num_bits]),
+        }
+    }
+
+    pub fn new_short(i: usize, num_bits: usize) -> Self {
+        Self {
+            size: num_bits,
+            data: BitStringEnum::Small(i),
+        }
+    }
+
+    pub fn make_long(&self) -> Self {
+        match &self.data {
+            BitStringEnum::Large(_) => self.clone(),
+            BitStringEnum::Small(i) => {
+                let mut i = reverse_n_bits(*i, self.size as u32);
+                let mut v = vec![];
+                for _ in 0..self.size {
+                    v.push((i & 1) == 1);
+                    i >>= 1;
+                }
+                Self {
+                    size: self.size,
+                    data: BitStringEnum::Large(v),
+                }
+            }
+        }
+    }
+
+    pub fn num_bits(&self) -> usize {
+        self.size
+    }
+
+    pub fn get_bit(&self, i: usize) -> bool {
+        match &self.data {
+            BitStringEnum::Large(v) => v[i],
+            BitStringEnum::Small(b) => {
+                let bit = (b >> (self.size - i - 1)) & 1;
+                bit == 1
+            }
+        }
+    }
+
+    pub fn set_bit(&mut self, i: usize, b: bool) {
+        match &mut self.data {
+            BitStringEnum::Large(v) => v[i] = b,
+            BitStringEnum::Small(_) => {
+                todo!()
+            }
+        }
+    }
+}
+
+impl From<Vec<bool>> for BitString {
+    fn from(value: Vec<bool>) -> Self {
+        Self {
+            size: value.len(),
+            data: BitStringEnum::Large(value),
+        }
+    }
+}
+
+pub fn fold_over_choices<T, F>(maxval: usize, length: usize, init: T, f: F) -> T
+where
+    F: Fn(T, &[usize]) -> T,
+{
+    if length > maxval {
+        return init;
+    }
+    fold_over_choices_rec(&mut vec![], 0, maxval, length, &f, init)
+}
+
+pub fn fold_over_choices_rec<T, F>(
+    prefix: &mut Vec<usize>,
+    minval: usize,
+    maxval: usize,
+    length: usize,
+    f: F,
+    init: T,
+) -> T
+where
+    F: Copy + Fn(T, &[usize]) -> T,
+{
+    (minval..=maxval - (length - (prefix.len() + 1))).fold(init, |acc, a| -> T {
+        prefix.push(a);
+        let ret = if prefix.len() == length {
+            f(acc, prefix)
+        } else {
+            fold_over_choices_rec(prefix, a + 1, maxval, length, f, acc)
+        };
+        prefix.pop();
+        ret
+    })
+}
+
+pub fn number_conserving_callback<F>(
+    prefix: &mut Vec<usize>,
+    minval: usize,
+    maxval: usize,
+    length: usize,
+    callback: &F,
+) where
+    F: Fn(&[usize]),
+{
+    for a in minval..=maxval {
+        prefix.push(a);
+        if prefix.len() == length {
+            callback(prefix)
+        } else {
+            number_conserving_callback(prefix, a + 1, maxval, length, callback)
+        }
+        prefix.pop();
+    }
+}
+
+pub fn rational_choose(n: usize, m: usize) -> BigRational {
+    if m > n {
+        return BigRational::zero();
+    }
+    if m == 0 || m == n {
+        return BigRational::one();
+    }
+    let top = 1..=n;
+    let bot = (1..=m).chain(1..=(n - m));
+    top.zip(bot).fold(BigRational::one(), |acc, (t, b)| {
+        acc * Ratio::new(BigInt::from(t), BigInt::from(b))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use num_traits::ToPrimitive;
+
+    #[test]
+    fn test_choose() {
+        for i in 0..=30 {
+            let mut acc = BigRational::zero();
+            for j in 0..=i {
+                acc += rational_choose(i, j);
+            }
+            assert!((acc.to_f64().expect("Error") - (1 << i) as f64).abs() < 1e-10);
+        }
+    }
+
+    #[test]
+    fn test_fold_num_cons() {
+        let v = fold_over_choices(5, 3, vec![], |mut v, x| {
+            v.push(x.to_vec());
+            v
+        });
+        // (5+1) choose 3
+        assert_eq!(v.len(), 20);
+    }
 
     #[test]
     fn test_reverse_bits() {
@@ -353,6 +524,15 @@ mod tests {
         for i in 0..1 << 4 {
             let result = permute_bits(i, &[0, 1, 2, 3]);
             assert_eq!(result, i)
+        }
+    }
+
+    #[test]
+    fn test_bitstring() {
+        let bs = BitString::new_short(0b00011011, 8);
+        let bl = bs.make_long();
+        for i in 0..8 {
+            assert_eq!(bs.get_bit(i), bl.get_bit(i));
         }
     }
 
