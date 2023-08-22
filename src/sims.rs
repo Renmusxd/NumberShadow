@@ -1,6 +1,6 @@
 use ndarray::{Array1, ArrayView1, ArrayView2};
 use num_traits::{One, Zero};
-use pyo3::{pyclass, pymethods, PyAny, PyResult, Python};
+use pyo3::{pyclass, pymethods, PyResult};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::mem::swap;
@@ -96,7 +96,10 @@ impl Experiment {
                 Sample::new(opis, BitString::new_short(i, self.qubits).make_long())
             })
             .collect::<Vec<_>>();
-        Ok(Samples { samples })
+        Ok(Samples {
+            ops: self.pairwise_ops.clone(),
+            samples,
+        })
     }
 }
 
@@ -396,6 +399,7 @@ impl DensityMatrix {
 #[pyclass]
 #[derive(Serialize, Deserialize, Default)]
 pub struct Samples {
+    pub ops: Array3<Complex<f64>>,
     pub samples: Vec<Sample>,
 }
 
@@ -406,10 +410,18 @@ impl Samples {
         Self::default()
     }
 
+    fn add(&mut self, gates: Vec<((usize, usize), usize)>, measurement: Vec<bool>) {
+        let sample = Sample::new(gates, BitString::from(measurement));
+        self.add_sample(sample)
+    }
+
     fn subset(&self, n: usize) -> Self {
         let mut rng = thread_rng();
         let subset = self.samples.choose_multiple(&mut rng, n).cloned().collect();
-        Self { samples: subset }
+        Self {
+            ops: self.ops.clone(),
+            samples: subset,
+        }
     }
 
     fn add_from(&mut self, other: &Samples) {
@@ -419,7 +431,10 @@ impl Samples {
     fn combine(&self, other: &Samples) -> Self {
         let mut samples = self.samples.clone();
         samples.extend(other.samples.iter().cloned());
-        Self { samples }
+        Self {
+            ops: self.ops.clone(),
+            samples,
+        }
     }
 
     fn num_samples(&self) -> usize {

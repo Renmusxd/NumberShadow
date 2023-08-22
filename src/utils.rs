@@ -1,7 +1,7 @@
 use ndarray::Array1;
 use num_bigint::BigInt;
 use num_complex::Complex;
-use num_rational::{BigRational, Ratio};
+use num_rational::BigRational;
 use num_traits::{One, Zero};
 use numpy::ndarray;
 use numpy::ndarray::{Array2, Array4, ArrayView2, Axis};
@@ -346,6 +346,17 @@ pub struct BitString {
     data: BitStringEnum,
 }
 
+#[pymethods]
+impl BitString {
+    #[new]
+    fn new(bits: Vec<bool>) -> Self {
+        Self {
+            size: bits.len(),
+            data: BitStringEnum::Large(bits),
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub enum BitStringEnum {
     Small(usize),
@@ -425,6 +436,9 @@ where
     if length > maxval {
         return init;
     }
+    if length == 0 {
+        return f(init, &[]);
+    }
     fold_over_choices_rec(&mut vec![], 0, maxval, length, &f, init)
 }
 
@@ -441,7 +455,7 @@ where
 {
     (minval..=maxval - (length - (prefix.len() + 1))).fold(init, |acc, a| -> T {
         prefix.push(a);
-        let ret = if prefix.len() == length {
+        let ret = if prefix.len() >= length {
             f(acc, prefix)
         } else {
             fold_over_choices_rec(prefix, a + 1, maxval, length, f, acc)
@@ -478,11 +492,51 @@ pub fn rational_choose(n: usize, m: usize) -> BigRational {
     if m == 0 || m == n {
         return BigRational::one();
     }
-    let top = 1..=n;
-    let bot = (1..=m).chain(1..=(n - m));
-    top.zip(bot).fold(BigRational::one(), |acc, (t, b)| {
-        acc * Ratio::new(BigInt::from(t), BigInt::from(b))
-    })
+
+    let top = (m + 1)..=n;
+    let bot = 1..=(n - m);
+    let res = rational_quotient_of_products(top, bot);
+    debug_assert_eq!(res, {
+        let top = 1..=n;
+        let bot = (1..=m).chain(1..=(n - m));
+        rational_quotient_of_products(top, bot)
+    });
+    res
+}
+
+pub fn rational_quotient_of_products<It1, It2>(top: It1, bot: It2) -> BigRational
+where
+    It1: IntoIterator<Item = usize>,
+    It2: IntoIterator<Item = usize>,
+{
+    let mut top = top.into_iter();
+    let mut bot = bot.into_iter();
+
+    let mut acc = BigRational::one();
+    loop {
+        let t = top.next();
+        let b = bot.next();
+        if t.is_none() && b.is_none() {
+            return acc;
+        }
+        if let Some(t) = t {
+            acc *= BigInt::from(t);
+        }
+        if let Some(b) = b {
+            acc /= BigInt::from(b);
+        }
+    }
+}
+
+pub fn permutation_product_list(l: usize) -> impl Iterator<Item = usize> {
+    1..=l
+}
+
+pub fn pairings_product_list(l: usize) -> Result<impl Iterator<Item = usize>, String> {
+    if l % 2 == 1 {
+        return Err("Pairings only valid for even.".to_string());
+    }
+    Ok((0..l / 2).map(|i| 2 * i + 1))
 }
 
 #[cfg(test)]

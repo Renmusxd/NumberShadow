@@ -11,8 +11,8 @@ crate-type = ["cdylib"]
 
 [dependencies]
 pyo3 = { version = "*", features = ["extension-module", "num-complex"] }
-ndarray = {version = "*", features = ["rayon"]}
-num-complex = "*"
+ndarray = {version = "*", features = ["rayon", "serde"]}
+num-complex = {version = "*", features = ["serde"]}
 numpy = "^0.19"
 num-traits = "*"
 rayon = "*"

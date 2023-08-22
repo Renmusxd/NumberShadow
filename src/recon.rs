@@ -9,7 +9,7 @@ use numpy::ndarray::{Array3, ArrayView3};
 use numpy::{IntoPyArray, PyArray1, ToPyArray};
 use pyo3::exceptions::PyValueError;
 use pyo3::types::PyComplex;
-use pyo3::{pyclass, pymethods, Py, PyResult, Python};
+use pyo3::{pyclass, pyfunction, pymethods, Py, PyResult, Python};
 use rayon::prelude::*;
 
 #[pyclass]
@@ -25,10 +25,14 @@ impl Reconstruction {
         samples: &'a Samples,
     ) -> impl ParallelIterator<Item = Complex<f64>> + 'a {
         // For each operator substring, estimate it using the relevant permutations.
+        let pairwise_ops = samples.ops.view();
         samples
             .samples
             .par_iter()
-            .map(|sample: &Sample| -> Complex<f64> { unimplemented!() })
+            .map(|sample: &Sample| -> Complex<f64> {
+                // estimate_op_string(opstring, sample, pairwise_ops, betas)
+                todo!()
+            })
     }
 }
 
@@ -79,10 +83,10 @@ fn estimate_op_string(
         .filter(|((a, b), _)| {
             let oa = opstring.opstring.get(*a).copied().unwrap_or(OpChar::I);
             let ob = opstring.opstring.get(*b).copied().unwrap_or(OpChar::I);
-            match (oa, ob) {
-                (OpChar::Plus, OpChar::Minus) | (OpChar::Minus, OpChar::Plus) => true,
-                _ => false,
-            }
+            matches!(
+                (oa, ob),
+                (OpChar::Plus, OpChar::Minus) | (OpChar::Minus, OpChar::Plus)
+            )
         })
         .count();
     debug_assert!(num_plus_joined_to_minus <= np);
@@ -146,10 +150,36 @@ fn estimate_op_string(
         gates: remap_gates,
         measurement: binstring,
     };
-    let z_estimate =
-        estimate_canonical_z_string(l - (np + nm), nz, &subsample, pairwise_ops, betas);
+    estimate_canonical_z_string(l - (np + nm), nz, &subsample, pairwise_ops, betas)
+}
 
-    z_estimate
+fn dumb_estimate_canonical_z_string(
+    l: usize,
+    k: usize,
+    sample: &Sample,
+    pairwise_ops: ArrayView3<Complex<f64>>,
+    betas: &[f64],
+) -> Complex<f64> {
+    fold_over_choices(l - 1, k, Complex::zero(), |acc, z_spots| {
+        let mut zmask = vec![false; l];
+        z_spots.iter().for_each(|x| zmask[*x] = true);
+        let d = k - zmask[..k].iter().copied().filter(|x| *x).count();
+        let expectation = sample
+            .gates
+            .iter()
+            .copied()
+            .map(|((i, j), iu)| {
+                let bi = sample.measurement.get_bit(i);
+                let bj = sample.measurement.get_bit(j);
+                let zi = zmask[i];
+                let zj = zmask[j];
+
+                compute_single_inner(bi, bj, zi, zj, pairwise_ops.index_axis(Axis(0), iu))
+            })
+            .product::<Complex<f64>>();
+
+        acc + betas[d] * expectation
+    })
 }
 
 fn estimate_canonical_z_string(
@@ -195,7 +225,7 @@ fn estimate_canonical_z_string(
         });
 
     // Iterate over all swap-distances d
-    (0..=k)
+    let res = (0..=k)
         .map(|d| {
             // Iterate over internal vs external swaps.
             betas[d]
@@ -239,7 +269,12 @@ fn estimate_canonical_z_string(
                     })
                     .sum::<Complex<f64>>()
         })
-        .sum::<Complex<f64>>()
+        .sum::<Complex<f64>>();
+    debug_assert_eq!(
+        res,
+        dumb_estimate_canonical_z_string(l, k, sample, pairwise_ops, betas)
+    );
+    res
 }
 
 fn count_pairs_for_us<It>(it: It, measurement: &BitString) -> (usize, usize, usize)
@@ -320,8 +355,18 @@ fn compute_single_inner(
 }
 
 fn delocalized_z_calculation(nz: usize, n00: usize, n01: usize, n11: usize) -> BigRational {
-    (0..=nz / 2)
+    // From the condition in the pairs sum:
+    // nz - 2m <= n00 + n11
+    // (nz - (n00 + n11)) / 2 <= m
+    let minval = if n00 + n11 >= nz {
+        0
+    } else {
+        (nz - n00 - n11 + 1) / 2
+    };
+
+    (minval..=nz / 2)
         .map(|m| {
+            println!("{:?}+{:?}\t{:?}-2({:?})", n00, n11, nz, m);
             let first_sum = (0..=m)
                 .map(|a| -> BigRational {
                     let b = m - a;
@@ -349,6 +394,38 @@ fn delocalized_z_calculation(nz: usize, n00: usize, n01: usize, n11: usize) -> B
                 .sum::<BigRational>();
             println!("(m={})\t{:?}\t{:?}", m, first_sum, second_sum);
             first_sum * second_sum
+        })
+        .sum::<BigRational>()
+}
+
+#[pyfunction]
+pub fn symmetry_eigenvalue(l: usize, a: usize) -> f64 {
+    symmetry_sector_eigenvalue(l, a)
+        .to_f64()
+        .unwrap_or_default()
+}
+
+fn symmetry_sector_eigenvalue(l: usize, a: usize) -> BigRational {
+    let one_third = BigRational::new(BigInt::from(-1), BigInt::from(3));
+    let two_third = BigRational::new(BigInt::from(2), BigInt::from(3));
+
+    (0..=a)
+        .map(|d| {
+            let pref = (one_third.clone()).pow(d as i32);
+            (0..=(a - d))
+                .filter(|m| m % 2 == (a - d) % 2)
+                .map(|m| {
+                    let pref = two_third.pow(m as i32);
+                    let choose = rational_choose(l - d - a, m);
+                    let top = permutation_product_list(a)
+                        .chain(pairings_product_list(a - d - m).expect("Must be even"))
+                        .chain(pairings_product_list(l - d - a - m).expect("Must be even"));
+                    let bot = permutation_product_list(a - d - m)
+                        .chain(pairings_product_list(l).expect("Must be even"));
+                    pref * choose * rational_quotient_of_products(top, bot)
+                })
+                .sum::<BigRational>()
+                * pref
         })
         .sum::<BigRational>()
 }
@@ -398,12 +475,32 @@ mod tests {
     use super::*;
     use ndarray::Array2;
 
+    fn make_pairwise_eye() -> Array3<Complex<f64>> {
+        let mut arr = Array3::zeros((1, 4, 4));
+        ndarray::Zip::indexed(&mut arr).for_each(|(_, i, j), x| {
+            if i == j {
+                *x = Complex::one();
+            } else {
+                *x = Complex::zero();
+            }
+        });
+        arr
+    }
+
     fn make_sample(l: usize, m: usize) -> Sample {
         let bm = BitString::new_short(m, l);
         let gates = (0..l / 2).map(|i| ((2 * i, 2 * i + 1), 0));
         Sample {
             gates: gates.collect(),
             measurement: bm,
+        }
+    }
+
+    #[test]
+    fn test_eigenvalue() {
+        for i in 0..=3 {
+            let res = symmetry_sector_eigenvalue(6, i);
+            println!("{:?}", res);
         }
     }
 
@@ -428,6 +525,30 @@ mod tests {
                 delocalized_z_calculation(i, l / 2, 0, 0),
                 delocalized_z_calculation(i, 0, 0, l / 2) * BigInt::from(-1).pow(i as u32),
             );
+        }
+    }
+
+    #[test]
+    fn test_deloc_dumb() {
+        let bm = BitString::new_short(0b00011011, 8);
+        let gates = (0..4).map(|i| ((2 * i, 2 * i + 1), 0)).collect::<Vec<_>>();
+        let (n00, n01, n11) = count_pairs_for_us(gates.iter().copied().map(|(x, _)| x), &bm);
+        assert_eq!((n00, n01, n11), (1, 2, 1));
+
+        let sample = Sample {
+            gates,
+            measurement: bm,
+        };
+        let pairwise = make_pairwise_eye();
+
+        for k in 0..8 {
+            let betas = vec![1.0; k + 1];
+            let res = dumb_estimate_canonical_z_string(8, k, &sample, pairwise.view(), &betas);
+            let deloc_res = delocalized_z_calculation(k, n00, n01, n11)
+                .to_f64()
+                .map(Complex::from)
+                .unwrap_or_default();
+            assert_eq!(res, deloc_res)
         }
     }
 
