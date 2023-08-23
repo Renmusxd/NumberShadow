@@ -2,7 +2,7 @@ mod recon;
 mod sims;
 pub mod utils;
 
-use crate::recon::{symmetry_eigenvalue, Operator, Reconstruction};
+use crate::recon::*;
 use crate::sims::*;
 use crate::utils::*;
 use pyo3::prelude::*;
@@ -18,5 +18,6 @@ fn shadow_reconstruction(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<Reconstruction>()?;
     m.add_class::<Operator>()?;
     m.add_wrapped(wrap_pyfunction!(symmetry_eigenvalue))?;
+    m.add_wrapped(wrap_pyfunction!(get_g_matrix))?;
     Ok(())
 }

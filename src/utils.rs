@@ -130,6 +130,16 @@ impl OperatorString {
         self.opstring.iter().map(|c| c.get_matrix()).collect()
     }
 
+    pub fn make_matrices_skip_ident(&self) -> Vec<(usize, Array2<Complex<f64>>)> {
+        self.opstring
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, c)| OpChar::I.ne(c))
+            .map(|(i, c)| (i, c.get_matrix()))
+            .collect()
+    }
+
     pub fn make_matrix(&self) -> CsMat<Complex<f64>> {
         let cmats = self.opstring.iter().map(|c| {
             let m = c.get_matrix();
@@ -340,7 +350,7 @@ where
 }
 
 #[pyclass]
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct BitString {
     size: usize,
     data: BitStringEnum,
@@ -357,7 +367,7 @@ impl BitString {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 pub enum BitStringEnum {
     Small(usize),
     Large(Vec<bool>),
@@ -433,7 +443,7 @@ pub fn fold_over_choices<T, F>(maxval: usize, length: usize, init: T, f: F) -> T
 where
     F: Fn(T, &[usize]) -> T,
 {
-    if length > maxval {
+    if length > maxval + 1 {
         return init;
     }
     if length == 0 {

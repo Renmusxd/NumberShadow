@@ -1,50 +1,115 @@
 use crate::sims::{Sample, Samples};
 use crate::utils::*;
-use ndarray::{s, Array4, ArrayView2, Axis};
+use ndarray::{s, Array1, Array2, Array4, ArrayView2, Axis};
+use ndarray_linalg::Inverse;
 use num_bigint::BigInt;
 use num_complex::Complex;
 use num_rational::BigRational;
-use num_traits::{One, ToPrimitive, Zero};
+use num_traits::{Inv, One, ToPrimitive, Zero};
 use numpy::ndarray::{Array3, ArrayView3};
-use numpy::{IntoPyArray, PyArray1, ToPyArray};
+use numpy::{IntoPyArray, PyArray1, PyArray2, ToPyArray};
 use pyo3::exceptions::PyValueError;
 use pyo3::types::PyComplex;
 use pyo3::{pyclass, pyfunction, pymethods, Py, PyResult, Python};
 use rayon::prelude::*;
 
-#[pyclass]
-pub struct Reconstruction {
-    pairwise_ops: Array3<Complex<f64>>,
-    pauli_pairs: Array4<Complex<f64>>,
+#[derive(Copy, Clone)]
+enum EstimatorType {
+    Smart,
+    Dumb,
 }
 
-impl Reconstruction {
-    fn estimate_operator_string_iterator<'a>(
-        &'a self,
-        opstring: &'a OperatorString,
-        samples: &'a Samples,
-    ) -> impl ParallelIterator<Item = Complex<f64>> + 'a {
-        // For each operator substring, estimate it using the relevant permutations.
-        let pairwise_ops = samples.ops.view();
-        samples
-            .samples
-            .par_iter()
-            .map(|sample: &Sample| -> Complex<f64> {
-                // estimate_op_string(opstring, sample, pairwise_ops, betas)
-                todo!()
-            })
+impl Default for EstimatorType {
+    fn default() -> Self {
+        EstimatorType::Smart
     }
+}
+
+#[pyclass]
+#[derive(Default)]
+pub struct Reconstruction {
+    estimator_type: EstimatorType,
 }
 
 #[pymethods]
 impl Reconstruction {
+    #[new]
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn use_smart_estimator(&mut self) {
+        self.estimator_type = EstimatorType::Smart
+    }
+    fn use_dumb_estimator(&mut self) {
+        self.estimator_type = EstimatorType::Dumb
+    }
+
     fn estimate_string_for_each_sample(
         &self,
         py: Python,
         op: String,
         samples: &Samples,
     ) -> PyResult<Py<PyArray1<Complex<f64>>>> {
-        unimplemented!()
+        let mut res = Array1::<Complex<f64>>::zeros((samples.samples.len(),));
+        let opstring =
+            OperatorString::try_from(op).map_err(|e| PyValueError::new_err(format!("{:?}", e)))?;
+        self.estimate_operator_string_iterator(&opstring, samples)
+            .map_err(PyValueError::new_err)?
+            .zip(res.axis_iter_mut(Axis(0)).into_par_iter())
+            .for_each(|(a, mut b)| *b.get_mut(()).unwrap() = a);
+        Ok(res.into_pyarray(py).to_owned())
+    }
+
+    fn estimate_string(&self, op: String, samples: &Samples) -> PyResult<Complex<f64>> {
+        let opstring =
+            OperatorString::try_from(op).map_err(|e| PyValueError::new_err(format!("{:?}", e)))?;
+        let sum = self
+            .estimate_operator_string_iterator(&opstring, samples)
+            .map_err(PyValueError::new_err)?
+            .sum::<Complex<f64>>();
+        Ok(sum / (samples.samples.len() as f64))
+    }
+}
+
+impl Reconstruction {
+    fn estimate_operator_string_iterator<'a>(
+        &self,
+        opstring: &'a OperatorString,
+        samples: &'a Samples,
+    ) -> Result<impl IndexedParallelIterator<Item = Complex<f64>> + 'a, String> {
+        let l = samples.l;
+        let k = opstring
+            .opstring
+            .iter()
+            .copied()
+            .filter(|o| OpChar::Z.eq(o))
+            .count();
+        let gmat = get_g_mat(l, k);
+        let gmat_inv = gmat.inv().map_err(|e| format!("{:?}", e))?;
+        let inv_c = Array1::from_iter((0..=k).map(|a| {
+            symmetry_sector_eigenvalue(l, a)
+                .to_f64()
+                .expect("Couldn't convert to f64")
+                .inv()
+        }));
+        let betas = gmat_inv.dot(&inv_c);
+
+        // For each operator substring, estimate it using the relevant permutations.
+        let pairwise_ops = samples.ops.view();
+        let estimator = self.estimator_type;
+        Ok(samples
+            .samples
+            .par_iter()
+            .map(move |sample: &Sample| -> Complex<f64> {
+                estimate_op_string(
+                    opstring,
+                    sample,
+                    pairwise_ops,
+                    betas.as_slice().unwrap(),
+                    estimator,
+                )
+            }))
     }
 }
 
@@ -53,6 +118,7 @@ fn estimate_op_string(
     sample: &Sample,
     pairwise_ops: ArrayView3<Complex<f64>>,
     betas: &[f64],
+    estimator: EstimatorType,
 ) -> Complex<f64> {
     let l = sample.measurement.num_bits();
     // Siphon off the +- pairs
@@ -72,15 +138,13 @@ fn estimate_op_string(
     if nm != np {
         return Complex::zero();
     }
-    if np > 0 {
-        unimplemented!()
-    }
     // Check joined.
-    let num_plus_joined_to_minus = sample
+    let pm_us = sample
         .gates
         .iter()
         .copied()
-        .filter(|((a, b), _)| {
+        .enumerate()
+        .filter(|(ui, ((a, b), _))| {
             let oa = opstring.opstring.get(*a).copied().unwrap_or(OpChar::I);
             let ob = opstring.opstring.get(*b).copied().unwrap_or(OpChar::I);
             matches!(
@@ -88,11 +152,27 @@ fn estimate_op_string(
                 (OpChar::Plus, OpChar::Minus) | (OpChar::Minus, OpChar::Plus)
             )
         })
-        .count();
+        .map(|(i, _)| i)
+        .collect::<Vec<_>>();
+    let num_plus_joined_to_minus = pm_us.len();
     debug_assert!(num_plus_joined_to_minus <= np);
 
     // If not all pluses are joined to minuses.
     if num_plus_joined_to_minus != np {
+        return Complex::zero();
+    }
+
+    // Now do the +- estimate
+    let pm_prod = pm_estimate(
+        l,
+        pm_us.len(),
+        pm_us.iter().copied().map(|iu| sample.gates[iu]),
+        &opstring.opstring,
+        &sample.measurement,
+        pairwise_ops,
+    );
+
+    if pm_prod.is_zero() {
         return Complex::zero();
     }
 
@@ -108,9 +188,9 @@ fn estimate_op_string(
         let op = opstring.opstring.get(*i).copied().unwrap_or(OpChar::I);
         match op {
             OpChar::Plus => 0,
-            OpChar::Minus => 0,
-            OpChar::Z => 1,
-            OpChar::I => 2,
+            OpChar::Minus => 1,
+            OpChar::Z => 2,
+            OpChar::I => 3,
         }
     });
     let pm_indices = &ops_and_meas[..np + nm];
@@ -150,7 +230,61 @@ fn estimate_op_string(
         gates: remap_gates,
         measurement: binstring,
     };
-    estimate_canonical_z_string(l - (np + nm), nz, &subsample, pairwise_ops, betas)
+
+    let z_estimate = match estimator {
+        EstimatorType::Smart => {
+            estimate_canonical_z_string(l - (np + nm), nz, &subsample, pairwise_ops, betas)
+        }
+        EstimatorType::Dumb => {
+            dumb_estimate_canonical_z_string(l - (np + nm), nz, &subsample, pairwise_ops, betas)
+        }
+    };
+
+    pm_prod * z_estimate
+}
+
+fn pm_estimate<It>(
+    l: usize,
+    np: usize,
+    it: It,
+    ops: &[OpChar],
+    measurement: &BitString,
+    pairwise_ops: ArrayView3<Complex<f64>>,
+) -> Complex<f64>
+where
+    It: IntoIterator<Item = ((usize, usize), usize)>,
+{
+    let expectation = it
+        .into_iter()
+        .map(|((i, j), ui)| {
+            let u = pairwise_ops.index_axis(Axis(0), ui);
+            let bi = measurement.get_bit(i);
+            let bj = measurement.get_bit(j);
+            let a_bstar = u[(1, 1)] * u[(1, 2)].conj();
+            let c_dstar = u[(2, 1)] * u[(2, 2)].conj();
+
+            let (z1, z2) = match (ops[i], ops[j]) {
+                (OpChar::Minus, OpChar::Plus) => (a_bstar, c_dstar),
+                (OpChar::Plus, OpChar::Minus) => (a_bstar.conj(), c_dstar.conj()),
+                _ => unreachable!(),
+            };
+
+            match (bi, bj) {
+                (false, true) => z1,
+                (true, false) => z2,
+                _ => Complex::zero(),
+            }
+        })
+        .product::<Complex<f64>>();
+
+    let top = pairings_product_list(l).expect("Can't make pairings");
+    let bot = pairings_product_list(l - 2 * np)
+        .expect("Can't make pairings")
+        .chain(permutation_product_list(np));
+    let eigenvalue_ratio = rational_quotient_of_products(top, bot) * BigInt::from(3).pow(np as u32);
+    let eigenvalue = eigenvalue_ratio.to_f64().unwrap_or_default();
+
+    expectation * eigenvalue
 }
 
 fn dumb_estimate_canonical_z_string(
@@ -164,19 +298,30 @@ fn dumb_estimate_canonical_z_string(
         let mut zmask = vec![false; l];
         z_spots.iter().for_each(|x| zmask[*x] = true);
         let d = k - zmask[..k].iter().copied().filter(|x| *x).count();
-        let expectation = sample
-            .gates
-            .iter()
-            .copied()
-            .map(|((i, j), iu)| {
-                let bi = sample.measurement.get_bit(i);
-                let bj = sample.measurement.get_bit(j);
-                let zi = zmask[i];
-                let zj = zmask[j];
 
-                compute_single_inner(bi, bj, zi, zj, pairwise_ops.index_axis(Axis(0), iu))
-            })
-            .product::<Complex<f64>>();
+        let expectation = prod_zs(
+            sample.gates.iter().copied(),
+            &zmask,
+            &sample.measurement,
+            pairwise_ops,
+        );
+
+        debug_assert_eq!(
+            expectation,
+            sample
+                .gates
+                .iter()
+                .copied()
+                .map(|((i, j), iu)| {
+                    let bi = sample.measurement.get_bit(i);
+                    let bj = sample.measurement.get_bit(j);
+                    let zi = zmask[i];
+                    let zj = zmask[j];
+
+                    compute_single_inner(bi, bj, zi, zj, pairwise_ops.index_axis(Axis(0), iu))
+                })
+                .product::<Complex<f64>>()
+        );
 
         acc + betas[d] * expectation
     })
@@ -200,7 +345,17 @@ fn estimate_canonical_z_string(
         .map(|(x, _)| *x)
         .filter(|(a, b)| *a >= k && *b >= k);
     let (n00, n01, n11) = count_pairs_for_us(it, &sample.measurement);
-    debug_assert_eq!(n00 + n01 + n11, l - (k + connected_to_zs.len()));
+    debug_assert_eq!(
+        2 * (n00 + n01 + n11),
+        l - (k + connected_to_zs.len()),
+        "Miscalculation: 2({}+{}+{}) is not {}-({} + {})",
+        n00,
+        n01,
+        n11,
+        l,
+        k,
+        connected_to_zs.len()
+    );
     // Use the counts to compute all the delocalized inner products we may need.
     let hs = (0..=k)
         .map(|nz| {
@@ -229,43 +384,50 @@ fn estimate_canonical_z_string(
         .map(|d| {
             // Iterate over internal vs external swaps.
             betas[d]
-                * (0..=d)
+                * (0..=d.min(connected_to_zs.len()))
                     .map(|a| -> Complex<f64> {
                         let b = d - a;
                         // Within specified nearby-operator indices:
                         // start with k Zs, remove b of them, swap a of them
                         // (k-d) of the Zs are still in place.
-                        fold_over_choices(k, k - d, Complex::zero(), |acc, stay_in_place| {
-                            fold_over_choices(connected_to_zs.len(), a, acc, |acc, moved_to_rel| {
-                                debug_assert_eq!(stay_in_place.len() + moved_to_rel.len(), k - b);
-                                let mut zlookup = vec![false; l];
-                                stay_in_place
-                                    .iter()
-                                    .copied()
-                                    .chain(moved_to_rel.iter().copied().map(|i| connected_to_zs[i]))
-                                    .for_each(|x| zlookup[x] = true);
+                        // if k = 0 then d = 0 but we still want to do one iteration.
+                        fold_over_choices(
+                            k.max(1) - 1,
+                            k - d,
+                            Complex::zero(),
+                            |acc, stay_in_place| {
+                                fold_over_choices(
+                                    connected_to_zs.len().max(1) - 1,
+                                    a,
+                                    acc,
+                                    |acc, moved_to_rel| {
+                                        debug_assert_eq!(
+                                            stay_in_place.len() + moved_to_rel.len(),
+                                            k - b
+                                        );
+                                        let mut zlookup = vec![false; l];
+                                        stay_in_place
+                                            .iter()
+                                            .copied()
+                                            .chain(
+                                                moved_to_rel
+                                                    .iter()
+                                                    .copied()
+                                                    .map(|i| connected_to_zs[i]),
+                                            )
+                                            .for_each(|x| zlookup[x] = true);
+                                        let prod = prod_zs(
+                                            us_in_op_region.iter().map(|ui| sample.gates[*ui]),
+                                            &zlookup,
+                                            &sample.measurement,
+                                            pairwise_ops,
+                                        );
 
-                                let prod = us_in_op_region
-                                    .iter()
-                                    .map(|ui| sample.gates[*ui])
-                                    .map(|((i, j), iu)| {
-                                        let bi = sample.measurement.get_bit(i);
-                                        let bj = sample.measurement.get_bit(j);
-                                        let zi = zlookup[i];
-                                        let zj = zlookup[j];
-
-                                        compute_single_inner(
-                                            bi,
-                                            bj,
-                                            zi,
-                                            zj,
-                                            pairwise_ops.index_axis(Axis(0), iu),
-                                        )
-                                    })
-                                    .product::<Complex<f64>>();
-                                acc + prod
-                            })
-                        }) * hs[b]
+                                        acc + prod
+                                    },
+                                )
+                            },
+                        ) * hs[b]
                     })
                     .sum::<Complex<f64>>()
         })
@@ -275,6 +437,27 @@ fn estimate_canonical_z_string(
         dumb_estimate_canonical_z_string(l, k, sample, pairwise_ops, betas)
     );
     res
+}
+
+fn prod_zs<It>(
+    ops: It,
+    zmask: &[bool],
+    measurement: &BitString,
+    pairwise_ops: ArrayView3<Complex<f64>>,
+) -> Complex<f64>
+where
+    It: IntoIterator<Item = ((usize, usize), usize)>,
+{
+    ops.into_iter()
+        .map(|((i, j), iu)| {
+            let bi = measurement.get_bit(i);
+            let bj = measurement.get_bit(j);
+            let zi = zmask[i];
+            let zj = zmask[j];
+
+            compute_single_inner(bi, bj, zi, zj, pairwise_ops.index_axis(Axis(0), iu))
+        })
+        .product::<Complex<f64>>()
 }
 
 fn count_pairs_for_us<It>(it: It, measurement: &BitString) -> (usize, usize, usize)
@@ -308,7 +491,7 @@ where
 {
     it.into_iter().filter_map(move |(a, b)| {
         let head = a.min(b);
-        let tail = a.min(b);
+        let tail = a.max(b);
         if head < k && tail >= k {
             Some(tail)
         } else {
@@ -366,7 +549,6 @@ fn delocalized_z_calculation(nz: usize, n00: usize, n01: usize, n11: usize) -> B
 
     (minval..=nz / 2)
         .map(|m| {
-            println!("{:?}+{:?}\t{:?}-2({:?})", n00, n11, nz, m);
             let first_sum = (0..=m)
                 .map(|a| -> BigRational {
                     let b = m - a;
@@ -392,7 +574,6 @@ fn delocalized_z_calculation(nz: usize, n00: usize, n01: usize, n11: usize) -> B
                         * rational_choose(n11, y)
                 })
                 .sum::<BigRational>();
-            println!("(m={})\t{:?}\t{:?}", m, first_sum, second_sum);
             first_sum * second_sum
         })
         .sum::<BigRational>()
@@ -426,6 +607,29 @@ fn symmetry_sector_eigenvalue(l: usize, a: usize) -> BigRational {
                 })
                 .sum::<BigRational>()
                 * pref
+        })
+        .sum::<BigRational>()
+}
+
+#[pyfunction]
+pub fn get_g_matrix(py: Python, l: usize, k: usize) -> Py<PyArray2<f64>> {
+    get_g_mat(l, k).to_pyarray(py).to_owned()
+}
+
+fn get_g_mat(l: usize, k: usize) -> Array2<f64> {
+    let mut g = Array2::zeros((k + 1, k + 1));
+    ndarray::Zip::indexed(&mut g)
+        .for_each(|(a, d), x| *x = get_g_mat_entry(l, k, a, d).to_f64().unwrap_or_default());
+    g
+}
+
+fn get_g_mat_entry(l: usize, k: usize, a: usize, d: usize) -> BigRational {
+    (0..=d)
+        .map(|x| {
+            let y = d - x;
+            let anti_symm = rational_choose(a, x) * BigInt::from(-1).pow(x as u32);
+            let symm = rational_choose(k - a, y) * rational_choose(l - k - a, y);
+            anti_symm * symm
         })
         .sum::<BigRational>()
 }
@@ -549,6 +753,29 @@ mod tests {
                 .map(Complex::from)
                 .unwrap_or_default();
             assert_eq!(res, deloc_res)
+        }
+    }
+
+    #[test]
+    fn test_canonical_across() {
+        let bm = BitString::new_short(0b00011011, 8);
+        let gates = (0..4).map(|i| ((2 * i, 2 * i + 1), 0)).collect::<Vec<_>>();
+
+        let sample = Sample {
+            gates,
+            measurement: bm,
+        };
+        let pairwise = make_pairwise_eye();
+
+        for k in 0..8 {
+            let mut betas = vec![0.0; k + 1];
+            for d in 0..(k + 1) {
+                betas[d] = 1.0;
+                let resa = dumb_estimate_canonical_z_string(8, k, &sample, pairwise.view(), &betas);
+                let resb = estimate_canonical_z_string(8, k, &sample, pairwise.view(), &betas);
+                assert_eq!(resa, resb);
+                betas[d] = 0.0;
+            }
         }
     }
 
