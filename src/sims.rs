@@ -9,7 +9,7 @@ use std::path::Path;
 
 use crate::recon::Operator;
 use crate::sims::DensityType::{MixedSparse, PureDense, PureSparse};
-use crate::utils::{make_sprs_onehot, BitString, OperatorString};
+use crate::utils::{BitString, OperatorString};
 use num_complex::Complex;
 use numpy::ndarray::{Array3, Axis};
 use numpy::{ndarray, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3};
@@ -18,7 +18,6 @@ use qip_iterators::iterators::MatrixOp;
 use rand::prelude::*;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use sprs::vec::IntoSparseVecIter;
 use sprs::*;
 
 #[pyclass]
@@ -503,50 +502,16 @@ impl Sample {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::make_numcons_pauli_pairs;
-    use ndarray::Array2;
+    use crate::utils::{make_numcons_pauli_pairs, make_sprs_onehot};
     use num_complex::Complex;
     use num_traits::One;
 
     impl DensityMatrix {
-        fn new_raw(mat: CsMat<Complex<f64>>) -> Self {
-            Self {
-                mat: MixedSparse(mat),
-            }
-        }
-
-        fn new_raw_pure(mat: CsVec<Complex<f64>>) -> Self {
-            Self {
-                mat: PureSparse(mat),
-            }
-        }
-
         fn new_raw_pure_dense(mat: Array1<Complex<f64>>) -> Self {
             Self {
                 mat: PureDense(mat),
             }
         }
-    }
-
-    fn make_simple_rho(qubits: usize, i: usize) -> CsMat<Complex<f64>> {
-        let mut a = TriMat::new((1 << qubits, 1 << qubits));
-        a.add_triplet(i, i, Complex::<f64>::one());
-        a.to_csr()
-    }
-    fn make_simple_rho_dense(qubits: usize, i: usize) -> Array1<Complex<f64>> {
-        let mut arr = Array1::zeros((1 << qubits,));
-        arr[i] = Complex::one();
-        arr
-    }
-
-    fn make_mixed_rho(qubits: usize) -> CsMat<Complex<f64>> {
-        let mut c = CsMat::eye(1 << qubits);
-        c.diag_iter_mut().for_each(|x| {
-            if let Some(x) = x {
-                *x /= (1 << qubits) as f64
-            }
-        });
-        c
     }
 
     fn x_flip_num() -> CsMat<Complex<f64>> {

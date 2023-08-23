@@ -1,28 +1,23 @@
 use crate::sims::{Sample, Samples};
 use crate::utils::*;
-use ndarray::{s, Array1, Array2, Array4, ArrayView2, Axis};
+use ndarray::{s, Array1, Array2, ArrayView2, Axis};
 use ndarray_linalg::Inverse;
 use num_bigint::BigInt;
 use num_complex::Complex;
 use num_rational::BigRational;
 use num_traits::{Inv, One, ToPrimitive, Zero};
-use numpy::ndarray::{Array3, ArrayView3};
+use numpy::ndarray::ArrayView3;
 use numpy::{IntoPyArray, PyArray1, PyArray2, ToPyArray};
 use pyo3::exceptions::PyValueError;
 use pyo3::types::PyComplex;
 use pyo3::{pyclass, pyfunction, pymethods, Py, PyResult, Python};
 use rayon::prelude::*;
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Default)]
 enum EstimatorType {
+    #[default]
     Smart,
     Dumb,
-}
-
-impl Default for EstimatorType {
-    fn default() -> Self {
-        EstimatorType::Smart
-    }
 }
 
 #[pyclass]
@@ -144,7 +139,7 @@ fn estimate_op_string(
         .iter()
         .copied()
         .enumerate()
-        .filter(|(ui, ((a, b), _))| {
+        .filter(|(_, ((a, b), _))| {
             let oa = opstring.opstring.get(*a).copied().unwrap_or(OpChar::I);
             let ob = opstring.opstring.get(*b).copied().unwrap_or(OpChar::I);
             matches!(
@@ -193,7 +188,6 @@ fn estimate_op_string(
             OpChar::I => 3,
         }
     });
-    let pm_indices = &ops_and_meas[..np + nm];
     let z_indices = &ops_and_meas[np + nm..np + nm + nz];
     let remaining_indices = &ops_and_meas[np + nm + nz..];
 
@@ -677,7 +671,7 @@ impl Operator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::Array2;
+    use ndarray::{Array2, Array3};
 
     fn make_pairwise_eye() -> Array3<Complex<f64>> {
         let mut arr = Array3::zeros((1, 4, 4));
