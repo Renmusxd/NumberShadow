@@ -398,26 +398,37 @@ impl DensityMatrix {
 }
 
 #[pyclass]
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize)]
 pub struct Samples {
     pub l: usize,
     pub ops: Array3<Complex<f64>>,
     pub samples: Vec<Sample>,
 }
 
+impl Samples {
+    pub fn new_raw(l: usize, ops: Array3<Complex<f64>>) -> Self {
+        Self {
+            l,
+            ops,
+            samples: vec![],
+        }
+    }
+}
+
 #[pymethods]
 impl Samples {
     #[new]
-    fn new() -> Self {
-        Self::default()
+    pub fn new(l: usize, ops: PyReadonlyArray3<Complex<f64>>) -> Self {
+        let ops = ops.as_array().to_owned();
+        Self::new_raw(l, ops)
     }
 
-    fn add(&mut self, gates: Vec<((usize, usize), usize)>, measurement: Vec<bool>) {
+    pub fn add(&mut self, gates: Vec<((usize, usize), usize)>, measurement: Vec<bool>) {
         let sample = Sample::new(gates, BitString::from(measurement));
         self.add_sample(sample)
     }
 
-    fn subset(&self, n: usize) -> Self {
+    pub fn subset(&self, n: usize) -> Self {
         let mut rng = thread_rng();
         let subset = self.samples.choose_multiple(&mut rng, n).cloned().collect();
         Self {
@@ -427,11 +438,11 @@ impl Samples {
         }
     }
 
-    fn add_from(&mut self, other: &Samples) {
+    pub fn add_from(&mut self, other: &Samples) {
         self.samples.extend(other.samples.iter().cloned());
     }
 
-    fn combine(&self, other: &Samples) -> Self {
+    pub fn combine(&self, other: &Samples) -> Self {
         let mut samples = self.samples.clone();
         samples.extend(other.samples.iter().cloned());
         Self {
@@ -441,19 +452,19 @@ impl Samples {
         }
     }
 
-    fn num_samples(&self) -> usize {
+    pub fn num_samples(&self) -> usize {
         self.samples.len()
     }
 
-    fn add_sample(&mut self, sample: Sample) {
+    pub fn add_sample(&mut self, sample: Sample) {
         self.samples.push(sample)
     }
 
-    fn get_sample(&self, index: usize) -> Sample {
+    pub fn get_sample(&self, index: usize) -> Sample {
         self.samples[index].clone()
     }
 
-    fn save_to(&self, filename: &str) -> PyResult<()> {
+    pub fn save_to(&self, filename: &str) -> PyResult<()> {
         let filepath = Path::new(filename);
         let mut file =
             File::create(filepath).map_err(|e| PyValueError::new_err(format!("{:?}", e)))?;
@@ -465,7 +476,7 @@ impl Samples {
     }
 
     #[staticmethod]
-    fn load_from(filename: &str) -> PyResult<Self> {
+    pub fn load_from(filename: &str) -> PyResult<Self> {
         let filepath = Path::new(filename);
         let mut buf = vec![];
         let mut file =

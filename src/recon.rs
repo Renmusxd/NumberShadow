@@ -74,15 +74,38 @@ impl Reconstruction {
         samples: &'a Samples,
     ) -> Result<impl IndexedParallelIterator<Item = Complex<f64>> + 'a, String> {
         let l = samples.l;
+        if opstring.opstring.len() != l {
+            return Err(format!(
+                "Operator String is only defined on {} out of {} sites.",
+                opstring.opstring.len(),
+                l
+            ));
+        }
+
         let k = opstring
             .opstring
             .iter()
             .copied()
             .filter(|o| OpChar::Z.eq(o))
             .count();
+
+        let ni = opstring
+            .opstring
+            .iter()
+            .copied()
+            .filter(|o| OpChar::I.eq(o))
+            .count();
+
+        if k > ni {
+            return Err(format!(
+                "Unimplemented: Operator String has more Z operators than I ({} vs {})",
+                k, ni
+            ));
+        }
+
         let gmat = get_g_mat(l, k);
         let gmat_inv = gmat.inv().map_err(|e| format!("{:?}", e))?;
-        let inv_c = Array1::from_iter((0..=k).map(|a| {
+        let inv_c = Array1::from_iter((0..=k.min(l - k)).map(|a| {
             symmetry_sector_eigenvalue(l, a)
                 .to_f64()
                 .expect("Couldn't convert to f64")
@@ -374,7 +397,7 @@ fn estimate_canonical_z_string(
         });
 
     // Iterate over all swap-distances d
-    let res = (0..=k)
+    let res = (0..=k.min(l - k))
         .map(|d| {
             // Iterate over internal vs external swaps.
             betas[d]
@@ -611,6 +634,7 @@ pub fn get_g_matrix(py: Python, l: usize, k: usize) -> Py<PyArray2<f64>> {
 }
 
 fn get_g_mat(l: usize, k: usize) -> Array2<f64> {
+    let k = k.min(l - k);
     let mut g = Array2::zeros((k + 1, k + 1));
     ndarray::Zip::indexed(&mut g)
         .for_each(|(a, d), x| *x = get_g_mat_entry(l, k, a, d).to_f64().unwrap_or_default());
@@ -771,6 +795,30 @@ mod tests {
                 betas[d] = 0.0;
             }
         }
+    }
+
+    #[test]
+    fn test_estimate_full() -> Result<(), String> {
+        let l = 8;
+        let pairwise = make_pairwise_eye();
+        let bm = BitString::new_short(0b00011011, l);
+        let gates = (0..l / 2)
+            .map(|i| ((2 * i, 2 * i + 1), 0))
+            .collect::<Vec<_>>();
+
+        let sample = Sample {
+            gates,
+            measurement: bm,
+        };
+        let mut samples = Samples::new_raw(l, pairwise);
+        samples.add_sample(sample);
+
+        let opstring = OperatorString::new((0..l).map(|_| OpChar::Z).collect::<Vec<_>>());
+
+        let recon = Reconstruction::new();
+        let it = recon.estimate_operator_string_iterator(&opstring, &samples)?;
+        it.for_each(|_| {});
+        Ok(())
     }
 
     #[test]
