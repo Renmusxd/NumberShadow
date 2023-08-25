@@ -92,7 +92,7 @@ pub fn make_numcons_pauli_pairs() -> Array4<Complex<f64>> {
                     let kron_prod = ndarray::linalg::kron(&opchar_a, &opchar_b);
                     pauli_pairs
                         .iter_mut()
-                        .zip(kron_prod.into_iter())
+                        .zip(kron_prod)
                         .for_each(|(x, y)| *x = y);
                 });
         });

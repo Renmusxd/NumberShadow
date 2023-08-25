@@ -21,9 +21,18 @@ enum EstimatorType {
 }
 
 #[pyclass]
-#[derive(Default)]
 pub struct Reconstruction {
     estimator_type: EstimatorType,
+    default_filtered: bool,
+}
+
+impl Default for Reconstruction {
+    fn default() -> Self {
+        Self {
+            default_filtered: true,
+            estimator_type: EstimatorType::default(),
+        }
+    }
 }
 
 #[pymethods]
@@ -45,22 +54,30 @@ impl Reconstruction {
         py: Python,
         op: String,
         samples: &Samples,
+        filtered: Option<bool>,
     ) -> PyResult<Py<PyArray1<Complex<f64>>>> {
+        let filtered = filtered.unwrap_or(self.default_filtered);
         let mut res = Array1::<Complex<f64>>::zeros((samples.samples.len(),));
         let opstring =
             OperatorString::try_from(op).map_err(|e| PyValueError::new_err(format!("{:?}", e)))?;
-        self.estimate_operator_string_iterator(&opstring, samples)
+        self.estimate_operator_string_iterator(&opstring, samples, filtered)
             .map_err(PyValueError::new_err)?
             .zip(res.axis_iter_mut(Axis(0)).into_par_iter())
             .for_each(|(a, mut b)| *b.get_mut(()).unwrap() = a);
         Ok(res.into_pyarray(py).to_owned())
     }
 
-    fn estimate_string(&self, op: String, samples: &Samples) -> PyResult<Complex<f64>> {
+    fn estimate_string(
+        &self,
+        op: String,
+        samples: &Samples,
+        filtered: Option<bool>,
+    ) -> PyResult<Complex<f64>> {
+        let filtered = filtered.unwrap_or(self.default_filtered);
         let opstring =
             OperatorString::try_from(op).map_err(|e| PyValueError::new_err(format!("{:?}", e)))?;
         let sum = self
-            .estimate_operator_string_iterator(&opstring, samples)
+            .estimate_operator_string_iterator(&opstring, samples, filtered)
             .map_err(PyValueError::new_err)?
             .sum::<Complex<f64>>();
         Ok(sum / (samples.samples.len() as f64))
@@ -72,6 +89,7 @@ impl Reconstruction {
         &self,
         opstring: &'a OperatorString,
         samples: &'a Samples,
+        filtered: bool,
     ) -> Result<impl IndexedParallelIterator<Item = Complex<f64>> + 'a, String> {
         let l = samples.l;
         if opstring.opstring.len() != l {
@@ -816,7 +834,7 @@ mod tests {
         let opstring = OperatorString::new((0..l).map(|_| OpChar::Z).collect::<Vec<_>>());
 
         let recon = Reconstruction::new();
-        let it = recon.estimate_operator_string_iterator(&opstring, &samples)?;
+        let it = recon.estimate_operator_string_iterator(&opstring, &samples, false)?;
         it.for_each(|_| {});
         Ok(())
     }
