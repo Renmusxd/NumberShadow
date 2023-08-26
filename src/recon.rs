@@ -3,9 +3,9 @@ use crate::utils::*;
 use ndarray::{s, Array1, Array2, ArrayView2, Axis};
 use ndarray_linalg::Inverse;
 use num_bigint::BigInt;
-use num_complex::Complex;
+use num_complex::{Complex, ComplexFloat};
 use num_rational::BigRational;
-use num_traits::{Inv, One, ToPrimitive, Zero};
+use num_traits::{Inv, One, Pow, ToPrimitive, Zero};
 use numpy::ndarray::ArrayView3;
 use numpy::{IntoPyArray, PyArray1, PyArray2, ToPyArray};
 use pyo3::exceptions::PyValueError;
@@ -38,8 +38,11 @@ impl Default for Reconstruction {
 #[pymethods]
 impl Reconstruction {
     #[new]
-    fn new() -> Self {
-        Self::default()
+    fn new(filtered: Option<bool>) -> Self {
+        Self {
+            default_filtered: filtered.unwrap_or(true),
+            estimator_type: EstimatorType::default(),
+        }
     }
 
     fn use_smart_estimator(&mut self) {
@@ -57,14 +60,13 @@ impl Reconstruction {
         filtered: Option<bool>,
     ) -> PyResult<Py<PyArray1<Complex<f64>>>> {
         let filtered = filtered.unwrap_or(self.default_filtered);
-        let mut res = Array1::<Complex<f64>>::zeros((samples.samples.len(),));
         let opstring =
             OperatorString::try_from(op).map_err(|e| PyValueError::new_err(format!("{:?}", e)))?;
-        self.estimate_operator_string_iterator(&opstring, samples, filtered)
+        let v = self
+            .estimate_operator_string_iterator(&opstring, samples, filtered)
             .map_err(PyValueError::new_err)?
-            .zip(res.axis_iter_mut(Axis(0)).into_par_iter())
-            .for_each(|(a, mut b)| *b.get_mut(()).unwrap() = a);
-        Ok(res.into_pyarray(py).to_owned())
+            .collect::<Vec<_>>();
+        Ok(Array1::from_vec(v).into_pyarray(py).to_owned())
     }
 
     fn estimate_string(
@@ -76,11 +78,12 @@ impl Reconstruction {
         let filtered = filtered.unwrap_or(self.default_filtered);
         let opstring =
             OperatorString::try_from(op).map_err(|e| PyValueError::new_err(format!("{:?}", e)))?;
-        let sum = self
+        let (total, count) = self
             .estimate_operator_string_iterator(&opstring, samples, filtered)
             .map_err(PyValueError::new_err)?
-            .sum::<Complex<f64>>();
-        Ok(sum / (samples.samples.len() as f64))
+            .map(|c| (c, 1usize))
+            .reduce(|| (Complex::zero(), 0), |(a, ac), (b, bc)| (a + b, ac + bc));
+        Ok(total / count as f64)
     }
 }
 
@@ -90,7 +93,7 @@ impl Reconstruction {
         opstring: &'a OperatorString,
         samples: &'a Samples,
         filtered: bool,
-    ) -> Result<impl IndexedParallelIterator<Item = Complex<f64>> + 'a, String> {
+    ) -> Result<impl ParallelIterator<Item = Complex<f64>> + 'a, String> {
         let l = samples.l;
         if opstring.opstring.len() != l {
             return Err(format!(
@@ -100,30 +103,51 @@ impl Reconstruction {
             ));
         }
 
-        let k = opstring
+        let [np, nm, nz, ni] = opstring
             .opstring
             .iter()
             .copied()
-            .filter(|o| OpChar::Z.eq(o))
-            .count();
+            .map(|op| match op {
+                OpChar::Plus => 0,
+                OpChar::Minus => 1,
+                OpChar::Z => 2,
+                OpChar::I => 3,
+            })
+            .fold([0; 4], |mut acc, i| {
+                acc[i] += 1usize;
+                acc
+            });
+        let mut ops_and_meas = (0..l).collect::<Vec<_>>();
+        ops_and_meas.sort_unstable_by_key(|i| {
+            let op = opstring.opstring.get(*i).copied().unwrap_or(OpChar::I);
+            match op {
+                OpChar::Plus => 0,
+                OpChar::Minus => 1,
+                OpChar::Z => 2,
+                OpChar::I => 3,
+            }
+        });
+        let z_indices = &ops_and_meas[np + nm..np + nm + nz];
+        let i_indices = &ops_and_meas[np + nm + nz..];
+        let opinfo = OpInfo {
+            l,
+            nz,
+            np,
+            nm,
+            z_indices: z_indices.to_vec(),
+            i_indices: i_indices.to_vec(),
+        };
 
-        let ni = opstring
-            .opstring
-            .iter()
-            .copied()
-            .filter(|o| OpChar::I.eq(o))
-            .count();
-
-        if k > ni {
+        if nz > ni {
             return Err(format!(
                 "Unimplemented: Operator String has more Z operators than I ({} vs {})",
-                k, ni
+                nz, ni
             ));
         }
 
-        let gmat = get_g_mat(l, k);
+        let gmat = get_g_mat(l, nz);
         let gmat_inv = gmat.inv().map_err(|e| format!("{:?}", e))?;
-        let inv_c = Array1::from_iter((0..=k.min(l - k)).map(|a| {
+        let inv_c = Array1::from_iter((0..=nz.min(l - nz)).map(|a| {
             symmetry_sector_eigenvalue(l, a)
                 .to_f64()
                 .expect("Couldn't convert to f64")
@@ -137,41 +161,59 @@ impl Reconstruction {
         Ok(samples
             .samples
             .par_iter()
+            .filter(move |sample| {
+                if filtered {
+                    filter_pm(opstring, sample)
+                } else {
+                    true
+                }
+            })
             .map(move |sample: &Sample| -> Complex<f64> {
                 estimate_op_string(
                     opstring,
+                    &opinfo,
                     sample,
                     pairwise_ops,
                     betas.as_slice().unwrap(),
                     estimator,
+                    filtered,
                 )
             }))
     }
 }
 
+fn filter_pm(opstring: &OperatorString, sample: &Sample) -> bool {
+    sample
+        .gates
+        .iter()
+        .copied()
+        .all(|((i, j), _)| match (opstring.get(i), opstring.get(j)) {
+            (OpChar::Plus, x) | (x, OpChar::Plus) => x.eq(&OpChar::Minus),
+            (OpChar::Minus, x) | (x, OpChar::Minus) => x.eq(&OpChar::Plus),
+            _ => true,
+        })
+}
+
+struct OpInfo {
+    l: usize,
+    nz: usize,
+    np: usize,
+    nm: usize,
+    z_indices: Vec<usize>,
+    i_indices: Vec<usize>,
+}
+
 fn estimate_op_string(
     opstring: &OperatorString,
+    opinfo: &OpInfo,
     sample: &Sample,
     pairwise_ops: ArrayView3<Complex<f64>>,
     betas: &[f64],
     estimator: EstimatorType,
+    filtered: bool,
 ) -> Complex<f64> {
-    let l = sample.measurement.num_bits();
-    // Siphon off the +- pairs
-    let np = opstring
-        .opstring
-        .iter()
-        .copied()
-        .filter(|op| OpChar::Plus.eq(op))
-        .count();
-    let nm = opstring
-        .opstring
-        .iter()
-        .copied()
-        .filter(|op| OpChar::Minus.eq(op))
-        .count();
     // If not number conserving.
-    if nm != np {
+    if opinfo.nm != opinfo.np {
         return Complex::zero();
     }
     // Check joined.
@@ -183,62 +225,51 @@ fn estimate_op_string(
         .filter(|(_, ((a, b), _))| {
             let oa = opstring.opstring.get(*a).copied().unwrap_or(OpChar::I);
             let ob = opstring.opstring.get(*b).copied().unwrap_or(OpChar::I);
-            matches!(
+            let pm_matched = matches!(
                 (oa, ob),
                 (OpChar::Plus, OpChar::Minus) | (OpChar::Minus, OpChar::Plus)
-            )
+            );
+            pm_matched
         })
         .map(|(i, _)| i)
         .collect::<Vec<_>>();
     let num_plus_joined_to_minus = pm_us.len();
-    debug_assert!(num_plus_joined_to_minus <= np);
+    debug_assert!(num_plus_joined_to_minus <= opinfo.np);
 
     // If not all pluses are joined to minuses.
-    if num_plus_joined_to_minus != np {
+    if filtered {
+        debug_assert!(num_plus_joined_to_minus == opinfo.np);
+    }
+    if num_plus_joined_to_minus != opinfo.np {
         return Complex::zero();
     }
 
     // Now do the +- estimate
     let pm_prod = pm_estimate(
-        l,
+        opinfo.l,
         pm_us.len(),
         pm_us.iter().copied().map(|iu| sample.gates[iu]),
         &opstring.opstring,
         &sample.measurement,
         pairwise_ops,
+        filtered,
     );
 
     if pm_prod.is_zero() {
         return Complex::zero();
     }
 
-    let nz = opstring
-        .opstring
+    debug_assert_eq!(
+        opinfo.l - (opinfo.np + opinfo.nm),
+        opinfo.z_indices.len() + opinfo.i_indices.len()
+    );
+    let mut binstring = BitString::new_long(opinfo.l - (opinfo.np + opinfo.nm));
+    let mut mapping = vec![usize::MAX; opinfo.l];
+    opinfo
+        .z_indices
         .iter()
         .copied()
-        .filter(|op| OpChar::Z.eq(op))
-        .count();
-
-    let mut ops_and_meas = (0..l).collect::<Vec<_>>();
-    ops_and_meas.sort_unstable_by_key(|i| {
-        let op = opstring.opstring.get(*i).copied().unwrap_or(OpChar::I);
-        match op {
-            OpChar::Plus => 0,
-            OpChar::Minus => 1,
-            OpChar::Z => 2,
-            OpChar::I => 3,
-        }
-    });
-    let z_indices = &ops_and_meas[np + nm..np + nm + nz];
-    let remaining_indices = &ops_and_meas[np + nm + nz..];
-
-    debug_assert_eq!(l - (np + nm), z_indices.len() + remaining_indices.len());
-    let mut binstring = BitString::new_long(l - (np + nm));
-    let mut mapping = vec![usize::MAX; l];
-    z_indices
-        .iter()
-        .copied()
-        .chain(remaining_indices.iter().copied())
+        .chain(opinfo.i_indices.iter().copied())
         .enumerate()
         .for_each(|(new_index, old_index)| {
             binstring.set_bit(new_index, sample.measurement.get_bit(old_index));
@@ -267,12 +298,20 @@ fn estimate_op_string(
     };
 
     let z_estimate = match estimator {
-        EstimatorType::Smart => {
-            estimate_canonical_z_string(l - (np + nm), nz, &subsample, pairwise_ops, betas)
-        }
-        EstimatorType::Dumb => {
-            dumb_estimate_canonical_z_string(l - (np + nm), nz, &subsample, pairwise_ops, betas)
-        }
+        EstimatorType::Smart => estimate_canonical_z_string(
+            opinfo.l - (opinfo.np + opinfo.nm),
+            opinfo.nz,
+            &subsample,
+            pairwise_ops,
+            betas,
+        ),
+        EstimatorType::Dumb => dumb_estimate_canonical_z_string(
+            opinfo.l - (opinfo.np + opinfo.nm),
+            opinfo.nz,
+            &subsample,
+            pairwise_ops,
+            betas,
+        ),
     };
 
     pm_prod * z_estimate
@@ -285,6 +324,7 @@ fn pm_estimate<It>(
     ops: &[OpChar],
     measurement: &BitString,
     pairwise_ops: ArrayView3<Complex<f64>>,
+    filtered: bool,
 ) -> Complex<f64>
 where
     It: IntoIterator<Item = ((usize, usize), usize)>,
@@ -312,14 +352,19 @@ where
         })
         .product::<Complex<f64>>();
 
-    let top = pairings_product_list(l).expect("Can't make pairings");
-    let bot = pairings_product_list(l - 2 * np)
-        .expect("Can't make pairings")
-        .chain(permutation_product_list(np));
-    let eigenvalue_ratio = rational_quotient_of_products(top, bot) * BigInt::from(3).pow(np as u32);
-    let eigenvalue = eigenvalue_ratio.to_f64().unwrap_or_default();
+    if filtered {
+        expectation * (3.0).pow(np as i32)
+    } else {
+        let top = pairings_product_list(l).expect("Can't make pairings");
+        let bot = pairings_product_list(l - 2 * np)
+            .expect("Can't make pairings")
+            .chain(permutation_product_list(np));
+        let eigenvalue_ratio =
+            rational_quotient_of_products(top, bot) * BigInt::from(3).pow(np as u32);
+        let eigenvalue = eigenvalue_ratio.to_f64().unwrap_or_default();
 
-    expectation * eigenvalue
+        expectation * eigenvalue
+    }
 }
 
 fn dumb_estimate_canonical_z_string(
@@ -467,9 +512,14 @@ fn estimate_canonical_z_string(
                     .sum::<Complex<f64>>()
         })
         .sum::<Complex<f64>>();
-    debug_assert_eq!(
+
+    let check = dumb_estimate_canonical_z_string(l, k, sample, pairwise_ops, betas);
+    debug_assert!(
+        (res - check).abs() < 1e-10,
+        "{:?} too far from {:?} ({:?})",
         res,
-        dumb_estimate_canonical_z_string(l, k, sample, pairwise_ops, betas)
+        check,
+        (res - check).abs()
     );
     res
 }
@@ -631,7 +681,7 @@ fn symmetry_sector_eigenvalue(l: usize, a: usize) -> BigRational {
             (0..=(a - d))
                 .filter(|m| m % 2 == (a - d) % 2)
                 .map(|m| {
-                    let pref = two_third.pow(m as i32);
+                    let pref = two_third.clone().pow(m as i32);
                     let choose = rational_choose(l - d - a, m);
                     let top = permutation_product_list(a)
                         .chain(pairings_product_list(a - d - m).expect("Must be even"))
@@ -831,9 +881,14 @@ mod tests {
         let mut samples = Samples::new_raw(l, pairwise);
         samples.add_sample(sample);
 
-        let opstring = OperatorString::new((0..l).map(|_| OpChar::Z).collect::<Vec<_>>());
+        let opstring = OperatorString::new(
+            (0..l / 2)
+                .map(|_| OpChar::Z)
+                .chain((0..l / 2).map(|_| OpChar::I))
+                .collect::<Vec<_>>(),
+        );
 
-        let recon = Reconstruction::new();
+        let recon = Reconstruction::new(None);
         let it = recon.estimate_operator_string_iterator(&opstring, &samples, false)?;
         it.for_each(|_| {});
         Ok(())
