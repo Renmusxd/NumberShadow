@@ -8,21 +8,23 @@ name = "shadow_reconstruction"
 crate-type = ["cdylib"]
 
 [features]
+default = ["sampling"]
+sampling = ["qip-iterators", "sprs"]
 
 [dependencies]
+serde = {version = "*", features = ["derive"]}
 pyo3 = { version = "*", features = ["extension-module", "num-complex"] }
 ndarray = {version = "*", features = ["rayon", "serde"]}
 num-complex = {version = "*", features = ["serde"]}
+num-rational = "*"
+num-bigint = "*"
 numpy = "^0.19"
 num-traits = "*"
 rayon = "*"
-sprs = "^0.11"
-rand = "^0.8"
-serde = {version = "^1.0", features = ["derive"]}
-bincode = "^1.3"
-qip-iterators = "^1.4"
-num-rational = "^0.4"
-num-bigint = "^0.4"
+rand = "*"
+bincode = "*"
+sprs = {version = "^0.11", optional = true}
+qip-iterators = {version = "^1.4", default-features = false, optional = true}
 
 
 [dependencies.ndarray-linalg]

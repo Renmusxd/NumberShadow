@@ -1,4 +1,4 @@
-use crate::sims::{Sample, Samples};
+use crate::samples::{Sample, Samples};
 use crate::utils::*;
 use ndarray::{s, Array1, Array2, ArrayView2, Axis};
 use ndarray_linalg::Inverse;

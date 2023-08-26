@@ -1,110 +1,20 @@
-use ndarray::Array1;
 use num_bigint::BigInt;
 use num_complex::Complex;
 use num_rational::BigRational;
 use num_traits::{One, Zero};
 use numpy::ndarray;
-use numpy::ndarray::{Array2, Array4, ArrayView2, Axis};
+use numpy::ndarray::Array2;
 use pyo3::prelude::*;
-use pyo3::types::IntoPyDict;
-use pyo3::Python;
 use serde::{Deserialize, Serialize};
-use sprs::{kronecker_product, CsMat, CsVec, TriMat};
-use std::ops::Add;
-
-pub fn permute_bits(input: usize, perm: &[usize]) -> usize {
-    let mut acc = 0;
-
-    for (i, j) in perm.iter().copied().enumerate() {
-        acc |= ((input >> (perm.len() - 1 - i)) & 1) << (perm.len() - 1 - j);
-    }
-    acc
-}
-
-pub fn make_sprs<P>(m: ArrayView2<P>) -> CsMat<P>
-where
-    P: Clone + Add<Output = P>,
-{
-    let mut a = TriMat::new((m.shape()[0], m.shape()[1]));
-    ndarray::Zip::indexed(m).for_each(|(row, col), val| {
-        a.add_triplet(row, col, val.clone());
-    });
-    a.to_csr()
-}
-
-pub fn make_sprs_onehot<P>(i: usize, n: usize) -> CsVec<P>
-where
-    P: Clone + Add<Output = P> + One,
-{
-    CsVec::new(n, vec![i], vec![P::one()])
-}
-
-pub fn make_dense_onehot<P>(i: usize, n: usize) -> Array1<P>
-where
-    P: One + Clone + Zero,
-{
-    let mut arr = Array1::zeros((n,));
-    arr[i] = P::one();
-    arr
-}
-
-pub fn make_perm<P>(perm: &[usize]) -> CsMat<P>
-where
-    P: Clone + Add<Output = P> + One,
-{
-    let mut a = TriMat::new((1 << perm.len(), 1 << perm.len()));
-    (0..1 << perm.len()).for_each(|i| a.add_triplet(permute_bits(i, perm), i, P::one()));
-    // (0..1 << perm.len()).for_each(|i| a.add_triplet(i, permute_bits(i, perm), P::one()));
-    a.to_csr()
-}
-
-pub fn fact(mut n: usize) -> usize {
-    let mut acc = 1;
-    while n > 1 {
-        acc *= n;
-        n -= 1;
-    }
-    acc
-}
-
-pub fn fact2(mut n: usize) -> usize {
-    let mut acc = 1;
-    while n > 1 {
-        acc *= n;
-        n -= 2;
-    }
-    acc
-}
-
-pub fn make_numcons_pauli_pairs() -> Array4<Complex<f64>> {
-    let mut pauli_pairs = Array4::<Complex<f64>>::zeros((4, 4, 4, 4));
-    pauli_pairs
-        .axis_iter_mut(Axis(0))
-        .enumerate()
-        .for_each(|(i, mut pauli_pairs)| {
-            let opchar_a = OpChar::try_from(i).unwrap().get_matrix();
-            pauli_pairs
-                .axis_iter_mut(Axis(0))
-                .enumerate()
-                .for_each(|(j, mut pauli_pairs)| {
-                    // Kron them
-                    let opchar_b = OpChar::try_from(j).unwrap().get_matrix();
-                    let kron_prod = ndarray::linalg::kron(&opchar_a, &opchar_b);
-                    pauli_pairs
-                        .iter_mut()
-                        .zip(kron_prod)
-                        .for_each(|(x, y)| *x = y);
-                });
-        });
-    pauli_pairs
-}
+#[cfg(feature = "sampling")]
+use sprs::{kronecker_product, CsMat, TriMat};
 
 /// Reverse last n bits of a
-pub fn reverse_n_bits(a: usize, n: u32) -> usize {
+pub(crate) fn reverse_n_bits(a: usize, n: u32) -> usize {
     a.reverse_bits() >> (usize::BITS - n)
 }
 
-pub fn kron_helper<It>(mats: It) -> CsMat<Complex<f64>>
+pub(crate) fn kron_helper<It>(mats: It) -> CsMat<Complex<f64>>
 where
     It: IntoIterator<Item = CsMat<Complex<f64>>>,
 {
@@ -126,11 +36,7 @@ pub struct OperatorString {
 }
 
 impl OperatorString {
-    pub fn make_matrices(&self) -> Vec<Array2<Complex<f64>>> {
-        self.opstring.iter().map(|c| c.get_matrix()).collect()
-    }
-
-    pub fn make_matrices_skip_ident(&self) -> Vec<(usize, Array2<Complex<f64>>)> {
+    pub(crate) fn make_matrices_skip_ident(&self) -> Vec<(usize, Array2<Complex<f64>>)> {
         self.opstring
             .iter()
             .copied()
@@ -140,7 +46,7 @@ impl OperatorString {
             .collect()
     }
 
-    pub fn make_matrix(&self) -> CsMat<Complex<f64>> {
+    pub(crate) fn make_matrix(&self) -> CsMat<Complex<f64>> {
         let cmats = self.opstring.iter().map(|c| {
             let m = c.get_matrix();
             let mut a = TriMat::new((m.shape()[0], m.shape()[1]));
@@ -192,23 +98,12 @@ impl OperatorString {
         }
     }
 
-    pub fn new<VC>(chars: VC) -> Self
+    pub(crate) fn new<VC>(chars: VC) -> Self
     where
         VC: Into<Vec<OpChar>>,
     {
         Self {
             indices: None,
-            opstring: chars.into(),
-        }
-    }
-
-    pub fn new_indices<VI, VC>(indices: Option<VI>, chars: VC) -> Self
-    where
-        VI: Into<Vec<usize>>,
-        VC: Into<Vec<OpChar>>,
-    {
-        Self {
-            indices: indices.map(|indices| indices.into()),
             opstring: chars.into(),
         }
     }
@@ -255,19 +150,10 @@ impl OperatorString {
                 })?;
         Ok(Self { indices, opstring })
     }
-
-    pub(crate) fn count_terms(&self) -> [usize; 4] {
-        let mut counts = [0, 0, 0, 0];
-        for op in &self.opstring {
-            let index: usize = (*op).into();
-            counts[index] += 1;
-        }
-        counts
-    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum OpChar {
+pub(crate) enum OpChar {
     Z,
     Plus,
     Minus,
@@ -275,7 +161,7 @@ pub enum OpChar {
 }
 
 impl OpChar {
-    pub fn get_matrix(&self) -> Array2<Complex<f64>> {
+    pub(crate) fn get_matrix(&self) -> Array2<Complex<f64>> {
         let o = Complex::<f64>::zero();
         let l = Complex::<f64>::one();
         match self {
@@ -326,29 +212,6 @@ impl TryFrom<char> for OpChar {
     }
 }
 
-pub fn scipy_mat<'a, P>(py: Python<'a>, mat: &CsMat<P>) -> Result<&'a PyAny, String>
-where
-    P: Clone + IntoPy<Py<PyAny>>,
-{
-    let scipy_sparse = PyModule::import(py, "scipy.sparse").map_err(|e| {
-        let res = format!("Python error: {e:?}");
-        e.print_and_set_sys_last_vars(py);
-        res
-    })?;
-    let indptr = mat.indptr().to_proper().to_vec();
-    scipy_sparse
-        .call_method(
-            "csr_matrix",
-            ((mat.data().to_vec(), mat.indices().to_vec(), indptr),),
-            Some([("shape", mat.shape())].into_py_dict(py)),
-        )
-        .map_err(|e| {
-            let res = format!("Python error: {e:?}");
-            e.print_and_set_sys_last_vars(py);
-            res
-        })
-}
-
 #[pyclass]
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct BitString {
@@ -368,27 +231,27 @@ impl BitString {
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
-pub enum BitStringEnum {
+pub(crate) enum BitStringEnum {
     Small(usize),
     Large(Vec<bool>),
 }
 
 impl BitString {
-    pub fn new_long(num_bits: usize) -> Self {
+    pub(crate) fn new_long(num_bits: usize) -> Self {
         Self {
             size: num_bits,
             data: BitStringEnum::Large(vec![false; num_bits]),
         }
     }
 
-    pub fn new_short(i: usize, num_bits: usize) -> Self {
+    pub(crate) fn new_short(i: usize, num_bits: usize) -> Self {
         Self {
             size: num_bits,
             data: BitStringEnum::Small(i),
         }
     }
 
-    pub fn make_long(&self) -> Self {
+    pub(crate) fn make_long(&self) -> Self {
         match &self.data {
             BitStringEnum::Large(_) => self.clone(),
             BitStringEnum::Small(i) => {
@@ -406,11 +269,11 @@ impl BitString {
         }
     }
 
-    pub fn num_bits(&self) -> usize {
+    pub(crate) fn num_bits(&self) -> usize {
         self.size
     }
 
-    pub fn get_bit(&self, i: usize) -> bool {
+    pub(crate) fn get_bit(&self, i: usize) -> bool {
         match &self.data {
             BitStringEnum::Large(v) => v[i],
             BitStringEnum::Small(b) => {
@@ -420,7 +283,7 @@ impl BitString {
         }
     }
 
-    pub fn set_bit(&mut self, i: usize, b: bool) {
+    pub(crate) fn set_bit(&mut self, i: usize, b: bool) {
         match &mut self.data {
             BitStringEnum::Large(v) => v[i] = b,
             BitStringEnum::Small(_) => {
@@ -439,7 +302,7 @@ impl From<Vec<bool>> for BitString {
     }
 }
 
-pub fn fold_over_choices<T, F>(maxval: usize, length: usize, init: T, f: F) -> T
+pub(crate) fn fold_over_choices<T, F>(maxval: usize, length: usize, init: T, f: F) -> T
 where
     F: Fn(T, &[usize]) -> T,
 {
@@ -452,7 +315,7 @@ where
     fold_over_choices_rec(&mut vec![], 0, maxval, length, &f, init)
 }
 
-pub fn fold_over_choices_rec<T, F>(
+pub(crate) fn fold_over_choices_rec<T, F>(
     prefix: &mut Vec<usize>,
     minval: usize,
     maxval: usize,
@@ -475,27 +338,7 @@ where
     })
 }
 
-pub fn number_conserving_callback<F>(
-    prefix: &mut Vec<usize>,
-    minval: usize,
-    maxval: usize,
-    length: usize,
-    callback: &F,
-) where
-    F: Fn(&[usize]),
-{
-    for a in minval..=maxval {
-        prefix.push(a);
-        if prefix.len() == length {
-            callback(prefix)
-        } else {
-            number_conserving_callback(prefix, a + 1, maxval, length, callback)
-        }
-        prefix.pop();
-    }
-}
-
-pub fn rational_choose(n: usize, m: usize) -> BigRational {
+pub(crate) fn rational_choose(n: usize, m: usize) -> BigRational {
     if m > n {
         return BigRational::zero();
     }
@@ -514,7 +357,7 @@ pub fn rational_choose(n: usize, m: usize) -> BigRational {
     res
 }
 
-pub fn rational_quotient_of_products<It1, It2>(top: It1, bot: It2) -> BigRational
+pub(crate) fn rational_quotient_of_products<It1, It2>(top: It1, bot: It2) -> BigRational
 where
     It1: IntoIterator<Item = usize>,
     It2: IntoIterator<Item = usize>,
@@ -538,11 +381,11 @@ where
     }
 }
 
-pub fn permutation_product_list(l: usize) -> impl Iterator<Item = usize> {
+pub(crate) fn permutation_product_list(l: usize) -> impl Iterator<Item = usize> {
     1..=l
 }
 
-pub fn pairings_product_list(l: usize) -> Result<impl Iterator<Item = usize>, String> {
+pub(crate) fn pairings_product_list(l: usize) -> Result<impl Iterator<Item = usize>, String> {
     if l % 2 == 1 {
         return Err("Pairings only valid for even.".to_string());
     }
@@ -553,6 +396,14 @@ pub fn pairings_product_list(l: usize) -> Result<impl Iterator<Item = usize>, St
 mod tests {
     use super::*;
     use num_traits::ToPrimitive;
+    pub fn permute_bits(input: usize, perm: &[usize]) -> usize {
+        let mut acc = 0;
+
+        for (i, j) in perm.iter().copied().enumerate() {
+            acc |= ((input >> (perm.len() - 1 - i)) & 1) << (perm.len() - 1 - j);
+        }
+        acc
+    }
 
     #[test]
     fn test_choose() {

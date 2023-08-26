@@ -1,15 +1,14 @@
 use ndarray::{Array1, ArrayView1, ArrayView2};
 use num_traits::{One, Zero};
-use pyo3::{pyclass, pymethods, PyResult};
-use std::fs::File;
-use std::io::{Read, Write};
+use pyo3::prelude::*;
 use std::mem::swap;
 use std::ops::Mul;
-use std::path::Path;
 
 use crate::recon::Operator;
+use crate::samples::{Sample, Samples};
 use crate::sims::DensityType::{MixedSparse, PureDense, PureSparse};
-use crate::utils::{BitString, OperatorString};
+use crate::utils::BitString;
+use crate::utils::OperatorString;
 use num_complex::Complex;
 use numpy::ndarray::{Array3, Axis};
 use numpy::{ndarray, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3};
@@ -17,7 +16,6 @@ use pyo3::exceptions::PyValueError;
 use qip_iterators::iterators::MatrixOp;
 use rand::prelude::*;
 use rayon::prelude::*;
-use serde::{Deserialize, Serialize};
 use sprs::*;
 
 #[pyclass]
@@ -397,125 +395,35 @@ impl DensityMatrix {
     }
 }
 
-#[pyclass]
-#[derive(Serialize, Deserialize)]
-pub struct Samples {
-    pub l: usize,
-    pub ops: Array3<Complex<f64>>,
-    pub samples: Vec<Sample>,
-}
-
-impl Samples {
-    pub fn new_raw(l: usize, ops: Array3<Complex<f64>>) -> Self {
-        Self {
-            l,
-            ops,
-            samples: vec![],
-        }
-    }
-}
-
-#[pymethods]
-impl Samples {
-    #[new]
-    pub fn new(l: usize, ops: PyReadonlyArray3<Complex<f64>>) -> Self {
-        let ops = ops.as_array().to_owned();
-        Self::new_raw(l, ops)
-    }
-
-    pub fn add(&mut self, gates: Vec<((usize, usize), usize)>, measurement: Vec<bool>) {
-        let sample = Sample::new(gates, BitString::from(measurement));
-        self.add_sample(sample)
-    }
-
-    pub fn subset(&self, n: usize) -> Self {
-        let mut rng = thread_rng();
-        let subset = self.samples.choose_multiple(&mut rng, n).cloned().collect();
-        Self {
-            l: self.l,
-            ops: self.ops.clone(),
-            samples: subset,
-        }
-    }
-
-    pub fn add_from(&mut self, other: &Samples) {
-        self.samples.extend(other.samples.iter().cloned());
-    }
-
-    pub fn combine(&self, other: &Samples) -> Self {
-        let mut samples = self.samples.clone();
-        samples.extend(other.samples.iter().cloned());
-        Self {
-            l: self.l,
-            ops: self.ops.clone(),
-            samples,
-        }
-    }
-
-    pub fn num_samples(&self) -> usize {
-        self.samples.len()
-    }
-
-    pub fn add_sample(&mut self, sample: Sample) {
-        self.samples.push(sample)
-    }
-
-    pub fn get_sample(&self, index: usize) -> Sample {
-        self.samples[index].clone()
-    }
-
-    pub fn save_to(&self, filename: &str) -> PyResult<()> {
-        let filepath = Path::new(filename);
-        let mut file =
-            File::create(filepath).map_err(|e| PyValueError::new_err(format!("{:?}", e)))?;
-        let encoded =
-            bincode::serialize(self).map_err(|e| PyValueError::new_err(format!("{:?}", e)))?;
-        file.write_all(&encoded)
-            .map_err(|e| PyValueError::new_err(format!("{:?}", e)))?;
-        Ok(())
-    }
-
-    #[staticmethod]
-    pub fn load_from(filename: &str) -> PyResult<Self> {
-        let filepath = Path::new(filename);
-        let mut buf = vec![];
-        let mut file =
-            File::open(filepath).map_err(|e| PyValueError::new_err(format!("{:?}", e)))?;
-        file.read_to_end(&mut buf)
-            .map_err(|e| PyValueError::new_err(format!("{:?}", e)))?;
-        bincode::deserialize(&buf).map_err(|e| PyValueError::new_err(format!("{:?}", e)))
-    }
-}
-
-#[pyclass]
-#[derive(Clone, Serialize, Deserialize)]
-pub struct Sample {
-    pub gates: Vec<((usize, usize), usize)>,
-    pub measurement: BitString,
-}
-
-#[pymethods]
-impl Sample {
-    #[new]
-    fn new(gates: Vec<((usize, usize), usize)>, measurement: BitString) -> Self {
-        Self { gates, measurement }
-    }
-
-    fn get_gates(&self) -> Vec<((usize, usize), usize)> {
-        self.gates.clone()
-    }
-
-    fn get_measurement(&self) -> BitString {
-        self.measurement.clone()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::{make_numcons_pauli_pairs, make_sprs_onehot};
+    use crate::utils::OpChar;
+    use ndarray::Array4;
     use num_complex::Complex;
-    use num_traits::One;
+
+    pub fn make_numcons_pauli_pairs() -> Array4<Complex<f64>> {
+        let mut pauli_pairs = Array4::<Complex<f64>>::zeros((4, 4, 4, 4));
+        pauli_pairs
+            .axis_iter_mut(Axis(0))
+            .enumerate()
+            .for_each(|(i, mut pauli_pairs)| {
+                let opchar_a = OpChar::try_from(i).unwrap().get_matrix();
+                pauli_pairs
+                    .axis_iter_mut(Axis(0))
+                    .enumerate()
+                    .for_each(|(j, mut pauli_pairs)| {
+                        // Kron them
+                        let opchar_b = OpChar::try_from(j).unwrap().get_matrix();
+                        let kron_prod = ndarray::linalg::kron(&opchar_a, &opchar_b);
+                        pauli_pairs
+                            .iter_mut()
+                            .zip(kron_prod)
+                            .for_each(|(x, y)| *x = y);
+                    });
+            });
+        pauli_pairs
+    }
 
     impl DensityMatrix {
         fn new_raw_pure_dense(mat: Array1<Complex<f64>>) -> Self {
@@ -523,63 +431,6 @@ mod tests {
                 mat: PureDense(mat),
             }
         }
-    }
-
-    fn x_flip_num() -> CsMat<Complex<f64>> {
-        let mut ub: TriMat<Complex<f64>> = TriMat::new((1 << 2, 1 << 2));
-        ub.add_triplet(0, 0, Complex::one());
-        ub.add_triplet(1, 2, Complex::one());
-        ub.add_triplet(2, 1, Complex::one());
-        ub.add_triplet(3, 3, Complex::one());
-        ub.to_csr()
-    }
-
-    #[test]
-    fn test_sprs_matmul() {
-        let qubits = 4;
-        let ua = CsMat::eye(1 << 2);
-        let ub = x_flip_num();
-        let u = kronecker_product(ua.view(), ub.view());
-        let b = make_sprs_onehot::<Complex<f64>>(0b0001, 1 << qubits);
-        let u_on_b = u.mul(&b).to_dense();
-        let bb = make_sprs_onehot::<Complex<f64>>(0b0010, 1 << qubits).to_dense();
-        assert_eq!(bb, u_on_b);
-
-        let b = make_sprs_onehot::<Complex<f64>>(0b1000, 1 << qubits);
-        let u_on_b = u.mul(&b).to_dense();
-        let bb = make_sprs_onehot::<Complex<f64>>(0b1000, 1 << qubits).to_dense();
-        assert_eq!(bb, u_on_b);
-
-        let u = kronecker_product(ub.view(), ua.view());
-        let b = make_sprs_onehot::<Complex<f64>>(0b0001, 1 << qubits);
-        let u_on_b = u.mul(&b).to_dense();
-        let bb = make_sprs_onehot::<Complex<f64>>(0b0001, 1 << qubits).to_dense();
-        assert_eq!(bb, u_on_b);
-
-        let b = make_sprs_onehot::<Complex<f64>>(0b1000, 1 << qubits);
-        let u_on_b = u.mul(&b).to_dense();
-        let bb = make_sprs_onehot::<Complex<f64>>(0b0100, 1 << qubits).to_dense();
-        assert_eq!(bb, u_on_b);
-    }
-
-    #[test]
-    fn test_sampling_pure_dense() -> Result<(), String> {
-        let qubits = 4;
-        let rho = CsVec::new(
-            1 << qubits,
-            (0..1 << qubits).collect(),
-            vec![Complex::one(); 1 << qubits],
-        );
-        let rho = rho.to_dense();
-
-        let pauli_pairs = make_numcons_pauli_pairs();
-        let flat_paulis = pauli_pairs.into_shape((16, 4, 4)).unwrap();
-        let exp = Experiment::new_raw(qubits, flat_paulis);
-
-        let rho = DensityMatrix::new_raw_pure_dense(rho);
-        let _samples = exp.sample_raw(&rho, 1000)?;
-
-        Ok(())
     }
 
     #[test]
