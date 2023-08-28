@@ -1,9 +1,10 @@
+use ndarray::{array, s, Array3};
 use num_bigint::BigInt;
 use num_complex::Complex;
 use num_rational::BigRational;
 use num_traits::{One, Zero};
-use numpy::ndarray;
 use numpy::ndarray::Array2;
+use numpy::{ndarray, IntoPyArray, PyArray3};
 use pyo3::prelude::*;
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "sampling")]
@@ -268,11 +269,6 @@ impl BitString {
             }
         }
     }
-
-    pub(crate) fn num_bits(&self) -> usize {
-        self.size
-    }
-
     pub(crate) fn get_bit(&self, i: usize) -> bool {
         match &self.data {
             BitStringEnum::Large(v) => v[i],
@@ -392,6 +388,32 @@ pub(crate) fn pairings_product_list(l: usize) -> Result<impl Iterator<Item = usi
     Ok((0..l / 2).map(|i| 2 * i + 1))
 }
 
+pub(crate) fn get_pauli_ops() -> Array3<Complex<f64>> {
+    let l = Complex::one();
+    let o = Complex::zero();
+    let rx = Complex::new(std::f64::consts::FRAC_1_SQRT_2, 0.0);
+    let ix = Complex::new(0.0, std::f64::consts::FRAC_1_SQRT_2);
+    let mids = array![
+        [[l, o], [o, l]],
+        [[rx, -rx], [rx, rx],],
+        [[rx, -ix], [-ix, rx]],
+    ];
+    let mut res = Array3::zeros((3, 4, 4));
+    let mut s = res.slice_mut(s![.., 0, 0]);
+    s.iter_mut().for_each(|x| *x = Complex::one());
+    let mut s = res.slice_mut(s![.., 3, 3]);
+    s.iter_mut().for_each(|x| *x = Complex::one());
+    let mut s = res.slice_mut(s![.., 1..3, 1..3]);
+    s.iter_mut().zip(mids).for_each(|(a, b)| *a = b);
+    res
+}
+
+#[pyfunction]
+pub fn make_pauli_ops(py: Python) -> Py<PyArray3<Complex<f64>>> {
+    let ops = get_pauli_ops();
+    ops.into_pyarray(py).to_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -403,6 +425,12 @@ mod tests {
             acc |= ((input >> (perm.len() - 1 - i)) & 1) << (perm.len() - 1 - j);
         }
         acc
+    }
+
+    #[test]
+    fn test_pauli_ops() {
+        let x = get_pauli_ops();
+        println!("{:?}", x)
     }
 
     #[test]

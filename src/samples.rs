@@ -6,7 +6,7 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
 
-use crate::utils::BitString;
+use crate::utils::{get_pauli_ops, BitString};
 use pyo3::prelude::*;
 use rand::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -32,8 +32,10 @@ impl Samples {
 #[pymethods]
 impl Samples {
     #[new]
-    pub fn new(l: usize, ops: PyReadonlyArray3<Complex<f64>>) -> Self {
-        let ops = ops.as_array().to_owned();
+    pub fn new(l: usize, ops: Option<PyReadonlyArray3<Complex<f64>>>) -> Self {
+        let ops = ops
+            .map(|ops| ops.as_array().to_owned())
+            .unwrap_or_else(get_pauli_ops);
         Self::new_raw(l, ops)
     }
 

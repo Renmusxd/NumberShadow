@@ -21,6 +21,7 @@ fn shadow_reconstruction(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<Operator>()?;
     m.add_wrapped(wrap_pyfunction!(symmetry_eigenvalue))?;
     m.add_wrapped(wrap_pyfunction!(get_g_matrix))?;
+    m.add_wrapped(wrap_pyfunction!(make_pauli_ops))?;
     #[cfg(feature = "sampling")]
     m.add_class::<DensityMatrix>()?;
     #[cfg(feature = "sampling")]

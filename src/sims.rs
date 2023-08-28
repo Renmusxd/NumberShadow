@@ -7,8 +7,8 @@ use std::ops::Mul;
 use crate::recon::Operator;
 use crate::samples::{Sample, Samples};
 use crate::sims::DensityType::{MixedSparse, PureDense, PureSparse};
-use crate::utils::BitString;
 use crate::utils::OperatorString;
+use crate::utils::{get_pauli_ops, BitString};
 use num_complex::Complex;
 use numpy::ndarray::{Array3, Axis};
 use numpy::{ndarray, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3};
@@ -25,10 +25,10 @@ pub struct Experiment {
 }
 
 impl Experiment {
-    fn new_raw(qubits: usize, ops: Array3<Complex<f64>>) -> Self {
+    fn new_raw(qubits: usize, ops: Option<Array3<Complex<f64>>>) -> Self {
         Self {
             qubits,
-            pairwise_ops: ops,
+            pairwise_ops: ops.unwrap_or_else(get_pauli_ops),
         }
     }
 }
@@ -104,8 +104,8 @@ impl Experiment {
 #[pymethods]
 impl Experiment {
     #[new]
-    fn new(qubits: usize, ops: PyReadonlyArray3<Complex<f64>>) -> Self {
-        let ops = ops.as_array().to_owned();
+    fn new(qubits: usize, ops: Option<PyReadonlyArray3<Complex<f64>>>) -> Self {
+        let ops = ops.map(|ops| ops.as_array().to_owned());
         Self::new_raw(qubits, ops)
     }
 
@@ -440,7 +440,7 @@ mod tests {
 
         let pauli_pairs = make_numcons_pauli_pairs();
         let flat_paulis = pauli_pairs.into_shape((16, 4, 4)).unwrap();
-        let exp = Experiment::new_raw(qubits, flat_paulis);
+        let exp = Experiment::new_raw(qubits, Some(flat_paulis));
 
         let rho = DensityMatrix::new_raw_pure_dense(rho);
         let _samples = exp.sample_raw(&rho, 1000)?;
