@@ -2,7 +2,7 @@
 
 Uses all-pairs reconstruction [see notebook](./jupyter/SimulationConsInverse.ipynb).
 
-Notebooks use `qutip` (from `pip install qutip`) to generate clifford gates, as well as the usual `jupyter`, `scipy`, `numpy`, `matplotlib`.
+Some (not all) notebooks use `qutip` (from `pip install qutip`) to generate clifford gates, as well as the usual `jupyter`, `scipy`, `numpy`, `matplotlib`.
 
 ## Installation
 1. Install rust on your system: https://www.rust-lang.org/learn/get-started
