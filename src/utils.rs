@@ -1,6 +1,6 @@
-use ndarray::{array, s, Array3};
+use ndarray::{array, s, Array3, ArrayView2};
 use num_bigint::BigInt;
-use num_complex::Complex;
+use num_complex::{Complex, ComplexFloat};
 use num_rational::BigRational;
 use num_traits::{One, Zero};
 use numpy::ndarray::Array2;
@@ -9,6 +9,7 @@ use pyo3::prelude::*;
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "sampling")]
 use sprs::{kronecker_product, CsMat, TriMat};
+use std::collections::HashMap;
 
 /// Reverse last n bits of a
 pub(crate) fn reverse_n_bits(a: usize, n: u32) -> usize {
@@ -214,7 +215,7 @@ impl TryFrom<char> for OpChar {
 }
 
 #[pyclass]
-#[derive(Clone, Serialize, Deserialize, Debug)]
+#[derive(Clone, Serialize, Deserialize, Debug, Hash, Eq, PartialEq)]
 pub struct BitString {
     size: usize,
     data: BitStringEnum,
@@ -231,13 +232,22 @@ impl BitString {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize, Debug)]
+#[derive(Clone, Serialize, Deserialize, Debug, Hash, Eq, PartialEq)]
 pub(crate) enum BitStringEnum {
     Small(usize),
     Large(Vec<bool>),
 }
 
 impl BitString {
+    pub(crate) fn to_int(&self) -> usize {
+        match &self.data {
+            BitStringEnum::Small(i) => *i,
+            BitStringEnum::Large(_) => {
+                todo!()
+            }
+        }
+    }
+
     pub(crate) fn new_long(num_bits: usize) -> Self {
         Self {
             size: num_bits,
@@ -282,10 +292,20 @@ impl BitString {
     pub(crate) fn set_bit(&mut self, i: usize, b: bool) {
         match &mut self.data {
             BitStringEnum::Large(v) => v[i] = b,
-            BitStringEnum::Small(_) => {
-                todo!()
+            BitStringEnum::Small(bb) => {
+                if b {
+                    *bb |= 1 << (self.size - i - 1);
+                } else {
+                    *bb &= !(1 << (self.size - i - 1));
+                }
             }
         }
+        debug_assert_eq!(self.get_bit(i), b);
+    }
+
+    pub(crate) fn iter_bits(&self) -> impl Iterator<Item = bool> + '_ {
+        let v = (0..self.size).map(|i| self.get_bit(i)).collect::<Vec<_>>();
+        v.into_iter()
     }
 }
 
@@ -414,6 +434,112 @@ pub fn make_pauli_ops(py: Python) -> Py<PyArray3<Complex<f64>>> {
     ops.into_pyarray(py).to_owned()
 }
 
+#[derive(Debug, Clone)]
+pub struct SparseVec {
+    n_qubits: usize,
+    data: HashMap<BitString, Complex<f64>>,
+}
+
+impl SparseVec {
+    pub fn new(n_qubits: usize) -> Self {
+        Self {
+            n_qubits,
+            data: Default::default(),
+        }
+    }
+
+    pub fn n_qubits(&self) -> usize {
+        self.n_qubits
+    }
+
+    pub fn dim(&self) -> usize {
+        1 << self.n_qubits
+    }
+
+    pub fn overwrite<K>(&mut self, row: K, val: Complex<f64>)
+    where
+        K: Into<BitString>,
+    {
+        self.data.insert(row.into(), val);
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&BitString, &Complex<f64>)> {
+        self.data.iter()
+    }
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (&BitString, &mut Complex<f64>)> {
+        self.data.iter_mut()
+    }
+
+    pub fn apply_twobody_op(&self, i: usize, j: usize, op: ArrayView2<Complex<f64>>) -> Self {
+        assert_eq!(op.shape(), &[4, 4]);
+        let mut v = HashMap::<BitString, Complex<f64>>::default();
+        self.data.iter().for_each(|(index, value)| {
+            if Complex::zero().eq(value) {
+                return;
+            }
+            let ib = index.get_bit(i);
+            let jb = index.get_bit(j);
+            let subcol = ((ib as usize) << 1) | (jb as usize);
+
+            let mut new_index = index.clone();
+            for io in [0, 1] {
+                new_index.set_bit(i, io == 1);
+                for jo in [0, 1] {
+                    new_index.set_bit(j, jo == 1);
+                    let subrow = (io << 1) | jo;
+                    if let Some(c) = op.get((subrow, subcol)) {
+                        if Complex::zero().ne(c) {
+                            *v.entry(new_index.clone()).or_insert(Complex::zero()) += c * value;
+                        }
+                    }
+                }
+            }
+        });
+        Self {
+            n_qubits: self.n_qubits,
+            data: v,
+        }
+    }
+
+    pub fn expectation(&self, opstring: &OperatorString) -> Complex<f64> {
+        let mut v = HashMap::<BitString, Complex<f64>>::default();
+        self.data.iter().for_each(|(index, value)| {
+            let mut new_index = index.clone();
+            let mut new_val = *value;
+            let mut insert = true;
+            for (i, op) in opstring.opstring.iter().enumerate() {
+                let b = index.get_bit(i);
+                match op {
+                    OpChar::Z if b => new_val *= -1.0,
+                    OpChar::Plus => {
+                        if !b {
+                            new_index.set_bit(i, true)
+                        } else {
+                            insert = false;
+                            break;
+                        }
+                    }
+                    OpChar::Minus => {
+                        if b {
+                            new_index.set_bit(i, false)
+                        } else {
+                            insert = false;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if insert {
+                v.insert(new_index, new_val);
+            }
+        });
+        v.into_iter()
+            .filter_map(|(index, val)| self.data.get(&index).map(|c| c.conj() * val))
+            .sum()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -476,6 +602,30 @@ mod tests {
         let bl = bs.make_long();
         for i in 0..8 {
             assert_eq!(bs.get_bit(i), bl.get_bit(i));
+        }
+    }
+
+    #[test]
+    fn test_bitstring_set_long() {
+        let bs = BitString::new_short(0b00000000, 8);
+        let mut bl = bs.make_long();
+        for i in 0..8 {
+            bl.set_bit(i, true);
+            for j in 0..8 {
+                assert_eq!(bl.get_bit(j), i == j);
+            }
+            bl.set_bit(i, false);
+        }
+    }
+    #[test]
+    fn test_bitstring_set() {
+        let mut bs = BitString::new_short(0b00000000, 8);
+        for i in 0..8 {
+            bs.set_bit(i, true);
+            for j in 0..8 {
+                assert_eq!(bs.get_bit(j), i == j);
+            }
+            bs.set_bit(i, false);
         }
     }
 

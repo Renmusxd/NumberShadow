@@ -7,8 +7,8 @@ use std::ops::Mul;
 use crate::recon::Operator;
 use crate::samples::{Sample, Samples};
 use crate::sims::DensityType::{MixedSparse, PureDense, PureSparse};
-use crate::utils::OperatorString;
 use crate::utils::{get_pauli_ops, BitString};
+use crate::utils::{OperatorString, SparseVec};
 use num_complex::Complex;
 use numpy::ndarray::{Array3, Axis};
 use numpy::{ndarray, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3};
@@ -87,6 +87,14 @@ impl Experiment {
                         let i = measure_channel_pure_dense(self.qubits, ops_it, v.view(), f);
                         i
                     }
+                    PureSparse(v) => {
+                        let ops_it = opis.iter().map(|((i, j), opi)| {
+                            let op = self.pairwise_ops.index_axis(Axis(0), *opi);
+                            ((*i, *j), op)
+                        });
+
+                        measure_channel_pure_sparse(self.qubits, ops_it, v, f)
+                    }
                     _ => unimplemented!(),
                 };
 
@@ -162,6 +170,34 @@ where
     (1 << qubits) - 1
 }
 
+// Performs best when u and s are csr
+fn measure_channel_pure_sparse<'a, It>(
+    qubits: usize,
+    ops: It,
+    rho: &SparseVec,
+    mut random_float: f64,
+) -> usize
+where
+    It: IntoIterator<Item = ((usize, usize), ArrayView2<'a, Complex<f64>>)>,
+{
+    debug_assert!(random_float >= 0.0);
+    debug_assert!(random_float <= 1.0);
+
+    let rho = ops.into_iter().fold(rho.clone(), |rho, ((i, j), op)| {
+        rho.apply_twobody_op(i, j, op)
+    });
+
+    for (i, busp) in rho.iter() {
+        let p = busp.norm_sqr();
+
+        random_float -= p;
+        if random_float <= 0.0 {
+            return i.to_int();
+        }
+    }
+    (1 << qubits) - 1
+}
+
 fn apply_ops<'a, OPS>(
     qubits: usize,
     ops: OPS,
@@ -185,7 +221,7 @@ fn apply_ops<'a, OPS>(
 
 pub enum DensityType {
     MixedSparse(CsMat<Complex<f64>>),
-    PureSparse(CsVec<Complex<f64>>),
+    PureSparse(SparseVec),
     PureDense(Array1<Complex<f64>>),
 }
 
@@ -217,18 +253,18 @@ impl DensityMatrix {
     }
 
     #[staticmethod]
-    fn new_pure_sparse(arr: PyReadonlyArray1<Complex<f64>>, tol: Option<f64>) -> Self {
-        let tol = tol.unwrap_or(1e-10);
-        let arr = arr.as_array();
-        let n = arr.len();
-        let (indices, data) = arr
-            .iter()
-            .copied()
-            .enumerate()
-            .filter(|(_, c)| c.norm() >= tol)
-            .unzip();
-
-        let v = CsVec::new(n, indices, data);
+    fn new_pure_sparse_indices(
+        num_qubits: usize,
+        indices: PyReadonlyArray1<usize>,
+        data: PyReadonlyArray1<Complex<f64>>,
+    ) -> Self {
+        let indices = indices.as_array().to_vec();
+        let data = data.as_array().to_vec();
+        let mut v = SparseVec::new(num_qubits);
+        indices
+            .into_iter()
+            .zip(data)
+            .for_each(|(i, c)| v.overwrite(BitString::new_short(i, num_qubits), c));
         Self { mat: PureSparse(v) }
     }
 
@@ -277,15 +313,8 @@ impl DensityMatrix {
 
     // Helper constructors
     #[staticmethod]
-    fn new_uniform_in_sector_sprs(qubits: usize, sector: u32) -> Self {
-        let indices = (0..1usize << qubits)
-            .into_par_iter()
-            .filter(|i| i.count_ones() == sector)
-            .collect::<Vec<_>>();
-        let n = indices.len();
-        let f = (n as f64).sqrt();
-        let v = CsVec::new(1 << qubits, indices, vec![Complex::one() / f; n]);
-        Self { mat: PureSparse(v) }
+    fn new_uniform_in_sector_sprs(_qubits: usize, _sector: u32) -> Self {
+        todo!()
     }
 
     #[staticmethod]
@@ -322,22 +351,7 @@ impl DensityMatrix {
                     Ok(s)
                 }
             }
-            PureSparse(v) => {
-                let opmat = opstring.make_matrix();
-                if opmat.shape().0 != v.dim() {
-                    Err(format!(
-                        "Expected operator of size ({}, {}) but found {:?}",
-                        v.dim(),
-                        v.dim(),
-                        opmat.shape()
-                    ))
-                } else {
-                    let mut cv = v.clone();
-                    cv.iter_mut().for_each(|(_, c)| *c = c.conj());
-                    let s = opmat.mul(v).dot(&cv);
-                    Ok(s)
-                }
-            }
+            PureSparse(v) => Ok(v.expectation(opstring)),
             PureDense(v) => {
                 let nqubits = opstring.opstring.len();
                 if 1 << nqubits != v.shape()[0] {
