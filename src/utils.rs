@@ -1,6 +1,6 @@
 use ndarray::{array, s, Array3, ArrayView2};
 use num_bigint::BigInt;
-use num_complex::{Complex, ComplexFloat};
+use num_complex::Complex;
 use num_rational::BigRational;
 use num_traits::{One, Zero};
 use numpy::ndarray::Array2;
@@ -230,39 +230,69 @@ impl BitString {
             data: BitStringEnum::Large(bits),
         }
     }
+
+    pub fn get_bit(&self, i: usize) -> bool {
+        match &self.data {
+            BitStringEnum::Large(v) => v[i],
+            BitStringEnum::Small(b) => {
+                let bit = (b >> (self.size - i - 1)) & 1;
+                bit == 1
+            }
+        }
+    }
+
+    pub fn set_bit(&mut self, i: usize, b: bool) {
+        match &mut self.data {
+            BitStringEnum::Large(v) => v[i] = b,
+            BitStringEnum::Small(bb) => {
+                if b {
+                    *bb |= 1 << (self.size - i - 1);
+                } else {
+                    *bb &= !(1 << (self.size - i - 1));
+                }
+            }
+        }
+        debug_assert_eq!(self.get_bit(i), b);
+    }
+
+    fn get_bits(&self) -> Vec<bool> {
+        match self.clone().make_long().data {
+            BitStringEnum::Small(_) => unreachable!(),
+            BitStringEnum::Large(v) => v,
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Hash, Eq, PartialEq)]
-pub(crate) enum BitStringEnum {
+pub enum BitStringEnum {
     Small(usize),
     Large(Vec<bool>),
 }
 
 impl BitString {
-    pub(crate) fn to_int(&self) -> usize {
-        match &self.data {
-            BitStringEnum::Small(i) => *i,
-            BitStringEnum::Large(_) => {
-                todo!()
-            }
-        }
-    }
-
-    pub(crate) fn new_long(num_bits: usize) -> Self {
+    pub fn new_long(num_bits: usize) -> Self {
         Self {
             size: num_bits,
             data: BitStringEnum::Large(vec![false; num_bits]),
         }
     }
 
-    pub(crate) fn new_short(i: usize, num_bits: usize) -> Self {
+    pub fn new_short(i: usize, num_bits: usize) -> Self {
         Self {
             size: num_bits,
             data: BitStringEnum::Small(i),
         }
     }
 
-    pub(crate) fn make_long(&self) -> Self {
+    pub fn make_short(&self) -> Self {
+        let mut x = Self::new_short(0, self.size);
+        for i in 0..self.size {
+            x.set_bit(i, self.get_bit(i));
+        }
+        x
+    }
+
+    pub fn make_long(&self) -> Self {
         match &self.data {
             BitStringEnum::Large(_) => self.clone(),
             BitStringEnum::Small(i) => {
@@ -279,31 +309,8 @@ impl BitString {
             }
         }
     }
-    pub(crate) fn get_bit(&self, i: usize) -> bool {
-        match &self.data {
-            BitStringEnum::Large(v) => v[i],
-            BitStringEnum::Small(b) => {
-                let bit = (b >> (self.size - i - 1)) & 1;
-                bit == 1
-            }
-        }
-    }
 
-    pub(crate) fn set_bit(&mut self, i: usize, b: bool) {
-        match &mut self.data {
-            BitStringEnum::Large(v) => v[i] = b,
-            BitStringEnum::Small(bb) => {
-                if b {
-                    *bb |= 1 << (self.size - i - 1);
-                } else {
-                    *bb &= !(1 << (self.size - i - 1));
-                }
-            }
-        }
-        debug_assert_eq!(self.get_bit(i), b);
-    }
-
-    pub(crate) fn iter_bits(&self) -> impl Iterator<Item = bool> + '_ {
+    pub fn iter_bits(&self) -> impl Iterator<Item = bool> + '_ {
         let v = (0..self.size).map(|i| self.get_bit(i)).collect::<Vec<_>>();
         v.into_iter()
     }
@@ -598,10 +605,13 @@ mod tests {
 
     #[test]
     fn test_bitstring() {
-        let bs = BitString::new_short(0b00011011, 8);
-        let bl = bs.make_long();
-        for i in 0..8 {
-            assert_eq!(bs.get_bit(i), bl.get_bit(i));
+        let num_bits = 8;
+        for i in 0..1 << num_bits {
+            let bs = BitString::new_short(i, num_bits);
+            let bl = bs.make_long();
+            for i in 0..num_bits {
+                assert_eq!(bs.get_bit(i), bl.get_bit(i));
+            }
         }
     }
 

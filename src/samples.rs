@@ -40,7 +40,10 @@ impl Samples {
     }
 
     pub fn add(&mut self, gates: Vec<((usize, usize), usize)>, measurement: Vec<bool>) {
-        let sample = Sample::new(gates, BitString::from(measurement));
+        let mut sample = Sample::new(gates, BitString::from(measurement));
+        if self.l <= std::mem::size_of::<usize>() * 8 {
+            sample.measurement = sample.measurement.make_short()
+        };
         self.add_sample(sample)
     }
 

@@ -98,7 +98,7 @@ impl Experiment {
                     _ => unimplemented!(),
                 };
 
-                Sample::new(opis, BitString::new_short(i, self.qubits).make_long())
+                Sample::new(opis, i)
             })
             .collect::<Vec<_>>();
         Ok(Samples {
@@ -128,7 +128,7 @@ fn measure_channel_pure_dense<'a, It>(
     ops: It,
     rho: ArrayView1<Complex<f64>>,
     mut random_float: f64,
-) -> usize
+) -> BitString
 where
     It: IntoIterator<Item = ((usize, usize), ArrayView2<'a, Complex<f64>>)>,
 {
@@ -164,10 +164,10 @@ where
 
         random_float -= p;
         if random_float <= 0.0 {
-            return i;
+            return BitString::new_short(i, qubits);
         }
     }
-    (1 << qubits) - 1
+    BitString::new_short((1 << qubits) - 1, qubits)
 }
 
 // Performs best when u and s are csr
@@ -176,7 +176,7 @@ fn measure_channel_pure_sparse<'a, It>(
     ops: It,
     rho: &SparseVec,
     mut random_float: f64,
-) -> usize
+) -> BitString
 where
     It: IntoIterator<Item = ((usize, usize), ArrayView2<'a, Complex<f64>>)>,
 {
@@ -192,10 +192,10 @@ where
 
         random_float -= p;
         if random_float <= 0.0 {
-            return i.to_int();
+            return i.clone();
         }
     }
-    (1 << qubits) - 1
+    BitString::new_short((1 << qubits) - 1, qubits)
 }
 
 fn apply_ops<'a, OPS>(
