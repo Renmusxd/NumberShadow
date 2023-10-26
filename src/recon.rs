@@ -16,8 +16,9 @@ use rayon::prelude::*;
 #[derive(Copy, Clone, Default)]
 enum EstimatorType {
     #[default]
-    Smart,
-    Dumb,
+    GlobalSmartResum,
+    GlobalSumAllStrings,
+    InversionByParts,
 }
 
 #[pyclass]
@@ -45,11 +46,14 @@ impl Reconstruction {
         }
     }
 
+    fn use_inversion_by_parts_estimator(&mut self) {
+        self.estimator_type = EstimatorType::InversionByParts
+    }
     fn use_smart_estimator(&mut self) {
-        self.estimator_type = EstimatorType::Smart
+        self.estimator_type = EstimatorType::GlobalSmartResum
     }
     fn use_dumb_estimator(&mut self) {
-        self.estimator_type = EstimatorType::Dumb
+        self.estimator_type = EstimatorType::GlobalSumAllStrings
     }
 
     fn estimate_string_for_each_sample(
@@ -298,14 +302,17 @@ fn estimate_op_string(
     };
 
     let z_estimate = match estimator {
-        EstimatorType::Smart => estimate_canonical_z_string(
+        EstimatorType::InversionByParts => {
+            estimate_canonical_z_string_by_parts(opinfo.nz, &subsample, pairwise_ops)
+        }
+        EstimatorType::GlobalSmartResum => estimate_canonical_z_string(
             opinfo.l - (opinfo.np + opinfo.nm),
             opinfo.nz,
             &subsample,
             pairwise_ops,
             betas,
         ),
-        EstimatorType::Dumb => dumb_estimate_canonical_z_string(
+        EstimatorType::GlobalSumAllStrings => dumb_estimate_canonical_z_string(
             opinfo.l - (opinfo.np + opinfo.nm),
             opinfo.nz,
             &subsample,
@@ -522,6 +529,28 @@ fn estimate_canonical_z_string(
         (res - check).abs()
     );
     res
+}
+
+fn estimate_canonical_z_string_by_parts(
+    k: usize,
+    sample: &Sample,
+    pairwise_ops: ArrayView3<Complex<f64>>,
+) -> Complex<f64> {
+    // The local channel is Mij = 1/2 ( 1/3 ( I - S ) + (I + S) )
+    // The local inverse is therefore iMij = 1/2 ( 3 (I - S) + (I + S) ) = 2I - S
+    sample
+        .gates
+        .iter()
+        .copied()
+        .map(|((i, j), iu)| {
+            let zi = i < k;
+            let zj = j < k;
+            let bi = sample.measurement.get_bit(i);
+            let bj = sample.measurement.get_bit(j);
+            let u = pairwise_ops.index_axis(Axis(0), iu);
+            2. * compute_single_inner(bi, bj, zi, zj, u) - compute_single_inner(bi, bj, zj, zi, u)
+        })
+        .product::<Complex<f64>>()
 }
 
 fn prod_zs<It>(
