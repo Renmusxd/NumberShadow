@@ -1,8 +1,8 @@
 # Number Conserving Shadows
 
-Uses all-pairs reconstruction [see notebook](./jupyter/SimulationConsInverse.ipynb).
+This repo provides a proof-of-concept implementation of the protocol described in https://arxiv.org/abs/2311.09291
 
-Some (not all) notebooks use `qutip` (from `pip install qutip`) to generate clifford gates, as well as the usual `jupyter`, `scipy`, `numpy`, `matplotlib`.
+A simple use case is described in [this notebook](./jupyter/SimpleExample.ipynb).
 
 ## Installation
 1. Install rust on your system: https://www.rust-lang.org/learn/get-started
@@ -16,3 +16,5 @@ Some (not all) notebooks use `qutip` (from `pip install qutip`) to generate clif
     1. `> make`
 6. Install the resulting wheel with pip
     1. `> pip install target/wheels/*`
+
+Some sparse matrix features require scipy, however this is not necessary for MVP.
